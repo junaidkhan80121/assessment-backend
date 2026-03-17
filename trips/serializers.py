@@ -60,6 +60,7 @@ class TripDetailSerializer(serializers.ModelSerializer):
             "status",
             "error_message",
             "route_geometry",
+            "route_options",
             "total_distance_miles",
             "leg1_miles",
             "leg2_miles",

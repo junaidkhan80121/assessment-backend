@@ -1,6 +1,6 @@
 # ELD Trip Planner - Backend
 
-This is the Django backend for the FMCSA-compliant ELD Trip Planner application. It handles routing integration (via OpenRouteService) and computes the complex 70-hour/8-day Hours of Service (HOS) rules.
+This is the Django backend for the FMCSA-compliant ELD Trip Planner application. It handles routing integration (via Mapbox Directions, with OpenRouteService as an optional geocoding fallback) and computes the complex 70-hour/8-day Hours of Service (HOS) rules.
 
 ## Prerequisites
 
@@ -28,7 +28,7 @@ This is the Django backend for the FMCSA-compliant ELD Trip Planner application.
    ```bash
    cp .env.example .env
    ```
-   **Crucial:** To calculate routes accurately, you need an OpenRouteService API key. Obtain a free key from [openrouteservice.org](https://openrouteservice.org/) and set `ORS_API_KEY` in your `.env`.
+   **Crucial:** To calculate routes accurately, you need a Mapbox access token. Obtain a free key from [mapbox.com](https://account.mapbox.com/) and set `MAPBOX_ACCESS_TOKEN` in your `.env`. Optionally, you can also provide an `ORS_API_KEY` to enable OpenRouteService-based geocoding; otherwise the app will use a simple city-name fallback for development.
 
 3. Run migrations:
    ```bash

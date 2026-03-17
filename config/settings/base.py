@@ -7,9 +7,11 @@ from datetime import timedelta
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+# Always load environment variables from the project .env,
+# regardless of which directory manage.py is executed from.
+load_dotenv(BASE_DIR / ".env")
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-dev-key-change-me")
 
@@ -156,6 +158,10 @@ CONTENT_SECURITY_POLICY = {
     },
 }
 
-# ── OpenRouteService ─────────────────────────────────────────────────────
+# ── Routing providers ─────────────────────────────────────────────────────
+# Optional: OpenRouteService for geocoding fallback
 ORS_API_KEY = os.getenv("ORS_API_KEY", "")
 ORS_BASE_URL = "https://api.openrouteservice.org"
+
+# Primary: Mapbox Directions for routing
+MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN", "")

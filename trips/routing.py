@@ -1,11 +1,57 @@
 """
-OpenRouteService integration for route geocoding and directions.
+Routing utilities: Mapbox Directions for routing, with OpenRouteService
+geocoding as an optional fallback and simple math-based fallbacks for
+local development without API keys.
 """
 import logging
 import requests
 from django.conf import settings
+import math
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_polyline(encoded: str) -> list[list[float]]:
+    """
+    Decode a Google-encoded polyline string into a list of [lat, lon] pairs.
+    ORS v2 returns geometry as an encoded polyline with precision 5 by default.
+    """
+    coords = []
+    index = 0
+    length = len(encoded)
+    lat = 0
+    lng = 0
+
+    while index < length:
+        # Decode latitude
+        result = 0
+        shift = 0
+        while True:
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += dlat
+
+        # Decode longitude
+        result = 0
+        shift = 0
+        while True:
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlng = ~(result >> 1) if (result & 1) else (result >> 1)
+        lng += dlng
+
+        coords.append([lat / 1e5, lng / 1e5])
+
+    return coords
 
 ORS_BASE_URL = "https://api.openrouteservice.org"
 
@@ -52,71 +98,63 @@ def get_route(
     alternatives: bool = False,
 ) -> dict | list[dict]:
     """
-    Get driving route between two points using OpenRouteService.
+    Get driving route between two points using Mapbox Directions API.
     If alternatives=False, returns dict.
     If alternatives=True, returns list of dicts.
     Dict format: {"distance_miles": float, "duration_hours": float, "geometry": list}.
     """
-    api_key = getattr(settings, "ORS_API_KEY", "")
-    if not api_key:
+    access_token = getattr(settings, "MAPBOX_ACCESS_TOKEN", "")
+    # If no Mapbox token is configured at all, fall back to the simple
+    # straight-line approximation so local development still works.
+    if not access_token:
         return _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
 
     try:
-        payload: dict = {
-            "coordinates": [
-                [start_lon, start_lat],
-                [end_lon, end_lat],
-            ],
-            # Ask ORS to return GeoJSON geometry so we can
-            # directly extract coordinate arrays for the map.
-            "geometry_format": "geojson",
-            "geometry_simplify": "false",
-            "instructions": "false",
-        }
-        if alternatives:
-            payload["alternative_routes"] = {
-                "share_factor": 0.6,
-                "target_count": 3
-            }
+        # Mapbox Directions API: https://api.mapbox.com/directions/v5/mapbox/driving-traffic
+        # We request full GeoJSON geometry and let Mapbox generate the route.
+        coordinates = f"{start_lon},{start_lat};{end_lon},{end_lat}"
+        url = f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/{coordinates}"
 
-        resp = requests.post(
-            f"{ORS_BASE_URL}/v2/directions/driving-hgv",
-            json=payload,
-            headers={
-                "Authorization": api_key,
-                "Content-Type": "application/json",
-            },
-            timeout=30,
-        )
+        params: dict = {
+            "access_token": access_token,
+            "geometries": "geojson",
+            "overview": "full",
+            "steps": "false",
+            "alternatives": "true" if alternatives else "false",
+        }
+
+        resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
 
-        results = []
+        results: list[dict] = []
         for route in data.get("routes", []):
-            distance_meters = route["summary"]["distance"]
-            duration_seconds = route["summary"]["duration"]
+            distance_meters = route.get("distance", 0.0)
+            duration_seconds = route.get("duration", 0.0)
 
-            # Decode geometry (GeoJSON format)
             geometry = route.get("geometry", {})
             if isinstance(geometry, dict):
-                coords = geometry.get("coordinates", [])
+                raw_coords = geometry.get("coordinates", [])
+                coords = [[c[1], c[0]] for c in raw_coords]  # [lat, lon]
             else:
                 coords = []
 
-            results.append({
-                "distance_miles": round(distance_meters / 1609.34, 2),
-                "duration_hours": round(duration_seconds / 3600, 2),
-                "geometry": [[c[1], c[0]] for c in coords],  # [lat, lon] format
-            })
+            results.append(
+                {
+                    "distance_miles": round(distance_meters / 1609.34, 2),
+                    "duration_hours": round(duration_seconds / 3600, 2),
+                    "geometry": coords,
+                }
+            )
 
         if not results:
-            return [] if alternatives else _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
-            
+            raise ValueError("Mapbox Directions returned no routes for the given coordinates.")
+
         return results if alternatives else results[0]
 
     except requests.RequestException as e:
-        logger.warning("ORS route failed: %s", e)
-        return _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
+        logger.warning("Mapbox route HTTP failure: %s", e)
+        raise ValueError("Routing service is temporarily unavailable, please try again.")
 
 
 def _fallback_geocode(query: str) -> dict:
@@ -177,8 +215,6 @@ def _fallback_route(
     Simple fallback route calculation using Haversine distance.
     Used when ORS API key is not configured.
     """
-    import math
-
     R = 3958.8  # Earth radius in miles
 
     lat1, lon1 = math.radians(start_lat), math.radians(start_lon)

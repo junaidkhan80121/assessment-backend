@@ -89,11 +89,14 @@ class TripViewSet(viewsets.ModelViewSet):
                 alternatives=False
             )
             
-            # Step 3: Get 3 ALTERNATIVE routes for Leg 2 (Pickup -> Dropoff)
+            # Step 3: Get one or more alternative routes for Leg 2 (Pickup -> Dropoff).
+            # The routing backend (Mapbox) will return multiple candidate routes
+            # when alternatives=True. We will mark the fastest one and still
+            # expose all options to the client.
             leg2_variants = get_route(
                 pickup_geo["lon"], pickup_geo["lat"],
                 dropoff_geo["lon"], dropoff_geo["lat"],
-                alternatives=True
+                alternatives=True,
             )
             
             route_options = []
@@ -149,8 +152,19 @@ class TripViewSet(viewsets.ModelViewSet):
             if not route_options:
                 raise ValueError("No viable routes could be planned within limits.")
 
-            # Step 5: Store results (Default to option 0)
-            best_route = route_options[0]
+            # Step 5: Rank and annotate route options.
+            # Fastest route is the one with the smallest total drive duration.
+            route_options.sort(key=lambda opt: opt["total_distance_miles"])
+            fastest_index = min(
+                range(len(route_options)),
+                key=lambda idx: route_options[idx]["total_drive_hours"],
+            )
+            for idx, option in enumerate(route_options):
+                option["is_fastest"] = idx == fastest_index
+                option["label"] = "Fastest route" if option["is_fastest"] else "Alternative route"
+
+            # Use the fastest route as the primary trip geometry.
+            best_route = route_options[fastest_index]
             
             trip.route_options = route_options
             trip.leg1_miles = best_route["leg1_miles"]
