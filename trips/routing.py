@@ -49,26 +49,39 @@ def geocode_location(query: str) -> dict:
 def get_route(
     start_lon: float, start_lat: float,
     end_lon: float, end_lat: float,
-) -> dict:
+    alternatives: bool = False,
+) -> dict | list[dict]:
     """
     Get driving route between two points using OpenRouteService.
-    Returns {"distance_miles": float, "duration_hours": float, "geometry": list}.
+    If alternatives=False, returns dict.
+    If alternatives=True, returns list of dicts.
+    Dict format: {"distance_miles": float, "duration_hours": float, "geometry": list}.
     """
     api_key = getattr(settings, "ORS_API_KEY", "")
     if not api_key:
-        return _fallback_route(start_lat, start_lon, end_lat, end_lon)
+        return _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
 
     try:
+        payload: dict = {
+            "coordinates": [
+                [start_lon, start_lat],
+                [end_lon, end_lat],
+            ],
+            # Ask ORS to return GeoJSON geometry so we can
+            # directly extract coordinate arrays for the map.
+            "geometry_format": "geojson",
+            "geometry_simplify": "false",
+            "instructions": "false",
+        }
+        if alternatives:
+            payload["alternative_routes"] = {
+                "share_factor": 0.6,
+                "target_count": 3
+            }
+
         resp = requests.post(
             f"{ORS_BASE_URL}/v2/directions/driving-hgv",
-            json={
-                "coordinates": [
-                    [start_lon, start_lat],
-                    [end_lon, end_lat],
-                ],
-                "geometry_simplify": "false",
-                "instructions": "false",
-            },
+            json=payload,
             headers={
                 "Authorization": api_key,
                 "Content-Type": "application/json",
@@ -78,26 +91,32 @@ def get_route(
         resp.raise_for_status()
         data = resp.json()
 
-        route = data["routes"][0]
-        distance_meters = route["summary"]["distance"]
-        duration_seconds = route["summary"]["duration"]
+        results = []
+        for route in data.get("routes", []):
+            distance_meters = route["summary"]["distance"]
+            duration_seconds = route["summary"]["duration"]
 
-        # Decode geometry (GeoJSON format)
-        geometry = route.get("geometry", {})
-        if isinstance(geometry, dict):
-            coords = geometry.get("coordinates", [])
-        else:
-            coords = []
+            # Decode geometry (GeoJSON format)
+            geometry = route.get("geometry", {})
+            if isinstance(geometry, dict):
+                coords = geometry.get("coordinates", [])
+            else:
+                coords = []
 
-        return {
-            "distance_miles": round(distance_meters / 1609.34, 2),
-            "duration_hours": round(duration_seconds / 3600, 2),
-            "geometry": [[c[1], c[0]] for c in coords],  # [lat, lon] format
-        }
+            results.append({
+                "distance_miles": round(distance_meters / 1609.34, 2),
+                "duration_hours": round(duration_seconds / 3600, 2),
+                "geometry": [[c[1], c[0]] for c in coords],  # [lat, lon] format
+            })
+
+        if not results:
+            return [] if alternatives else _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
+            
+        return results if alternatives else results[0]
 
     except requests.RequestException as e:
         logger.warning("ORS route failed: %s", e)
-        return _fallback_route(start_lat, start_lon, end_lat, end_lon)
+        return _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
 
 
 def _fallback_geocode(query: str) -> dict:
@@ -152,7 +171,8 @@ def _fallback_geocode(query: str) -> dict:
 def _fallback_route(
     start_lat: float, start_lon: float,
     end_lat: float, end_lon: float,
-) -> dict:
+    alternatives: bool = False,
+) -> dict | list[dict]:
     """
     Simple fallback route calculation using Haversine distance.
     Used when ORS API key is not configured.
@@ -182,8 +202,33 @@ def _fallback_route(
         [end_lat, end_lon],
     ]
 
-    return {
+    route_1 = {
         "distance_miles": round(road_distance, 2),
         "duration_hours": round(duration_hours, 2),
         "geometry": geometry,
     }
+    
+    if not alternatives:
+        return route_1
+        
+    route_2 = {
+        "distance_miles": round(road_distance * 1.1, 2),
+        "duration_hours": round(duration_hours * 1.2, 2),
+        "geometry": [
+            [start_lat, start_lon],
+            [start_lat + (dlat * 0.5) + 0.1, start_lon + (dlon * 0.5) - 0.1],
+            [end_lat, end_lon],
+        ],
+    }
+    
+    route_3 = {
+        "distance_miles": round(road_distance * 1.15, 2),
+        "duration_hours": round(duration_hours * 1.05, 2),
+        "geometry": [
+            [start_lat, start_lon],
+            [start_lat + (dlat * 0.5) - 0.2, start_lon + (dlon * 0.5) + 0.1],
+            [end_lat, end_lon],
+        ],
+    }
+
+    return [route_1, route_2, route_3]

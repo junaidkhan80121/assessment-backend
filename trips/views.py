@@ -82,52 +82,91 @@ class TripViewSet(viewsets.ModelViewSet):
             trip.dropoff_location_lat = dropoff_geo["lat"]
             trip.dropoff_location_lon = dropoff_geo["lon"]
 
-            # Step 2: Get routes for both legs
+            # Step 2: Get route for Leg 1 (Current -> Pickup)
             leg1_route = get_route(
                 current_geo["lon"], current_geo["lat"],
                 pickup_geo["lon"], pickup_geo["lat"],
+                alternatives=False
             )
-            leg2_route = get_route(
+            
+            # Step 3: Get 3 ALTERNATIVE routes for Leg 2 (Pickup -> Dropoff)
+            leg2_variants = get_route(
                 pickup_geo["lon"], pickup_geo["lat"],
                 dropoff_geo["lon"], dropoff_geo["lat"],
+                alternatives=True
             )
+            
+            route_options = []
+            
+            # Process each variant into a complete trip option
+            for i, leg2_route in enumerate(leg2_variants):
+                leg1_miles = leg1_route["distance_miles"]
+                leg2_miles = leg2_route["distance_miles"]
+                leg1_duration = leg1_route["duration_hours"]
+                leg2_duration = leg2_route["duration_hours"]
+                total_distance = leg1_miles + leg2_miles
+                geometry = leg1_route["geometry"] + leg2_route["geometry"]
+                
+                # Step 4: Run HOS engine for this specific variant
+                try:
+                    hos_result = plan_trip(
+                        total_distance_miles=total_distance,
+                        leg1_miles=leg1_miles,
+                        leg2_miles=leg2_miles,
+                        leg1_duration_hours=leg1_duration,
+                        leg2_duration_hours=leg2_duration,
+                        current_cycle_used=data["current_cycle_used"],
+                        pickup_location=data["pickup_location"],
+                        dropoff_location=data["dropoff_location"],
+                        pickup_lat=pickup_geo["lat"],
+                        pickup_lon=pickup_geo["lon"],
+                        dropoff_lat=dropoff_geo["lat"],
+                        dropoff_lon=dropoff_geo["lon"],
+                        current_location=data["current_location"],
+                        current_lat=current_geo["lat"],
+                        current_lon=current_geo["lon"],
+                    )
+                    
+                    route_options.append({
+                        "id": i,
+                        "leg1_miles": leg1_miles,
+                        "leg2_miles": leg2_miles,
+                        "total_distance_miles": total_distance,
+                        "leg1_duration_hours": leg1_duration,
+                        "leg2_duration_hours": leg2_duration,
+                        "route_geometry": geometry,
+                        "stops": hos_result["stops"],
+                        "daily_logs": hos_result["daily_logs"],
+                        "total_on_duty_hours": hos_result["total_on_duty_hours"],
+                        "total_drive_hours": hos_result["total_drive_hours"],
+                        "hos_compliant": hos_result["hos_compliant"],
+                        "weekly_hours_used": hos_result["weekly_hours_used"],
+                        "weekly_hours_remaining": hos_result["weekly_hours_remaining"],
+                    })
+                except ValueError as e:
+                    logger.warning("Variant %s violated constraints immediately: %s", i, e)
 
-            trip.leg1_miles = leg1_route["distance_miles"]
-            trip.leg2_miles = leg2_route["distance_miles"]
-            trip.leg1_duration_hours = leg1_route["duration_hours"]
-            trip.leg2_duration_hours = leg2_route["duration_hours"]
-            trip.total_distance_miles = trip.leg1_miles + trip.leg2_miles
+            if not route_options:
+                raise ValueError("No viable routes could be planned within limits.")
 
-            # Merge route geometries
-            trip.route_geometry = leg1_route["geometry"] + leg2_route["geometry"]
-
-            # Step 3: Run HOS engine
-            hos_result = plan_trip(
-                total_distance_miles=trip.total_distance_miles,
-                leg1_miles=trip.leg1_miles,
-                leg2_miles=trip.leg2_miles,
-                leg1_duration_hours=trip.leg1_duration_hours,
-                leg2_duration_hours=trip.leg2_duration_hours,
-                current_cycle_used=data["current_cycle_used"],
-                pickup_location=data["pickup_location"],
-                dropoff_location=data["dropoff_location"],
-                pickup_lat=pickup_geo["lat"],
-                pickup_lon=pickup_geo["lon"],
-                dropoff_lat=dropoff_geo["lat"],
-                dropoff_lon=dropoff_geo["lon"],
-                current_location=data["current_location"],
-                current_lat=current_geo["lat"],
-                current_lon=current_geo["lon"],
-            )
-
-            # Step 4: Store results
-            trip.stops = hos_result["stops"]
-            trip.daily_logs = hos_result["daily_logs"]
-            trip.total_on_duty_hours = hos_result["total_on_duty_hours"]
-            trip.total_drive_hours = hos_result["total_drive_hours"]
-            trip.hos_compliant = hos_result["hos_compliant"]
-            trip.weekly_hours_used = hos_result["weekly_hours_used"]
-            trip.weekly_hours_remaining = hos_result["weekly_hours_remaining"]
+            # Step 5: Store results (Default to option 0)
+            best_route = route_options[0]
+            
+            trip.route_options = route_options
+            trip.leg1_miles = best_route["leg1_miles"]
+            trip.leg2_miles = best_route["leg2_miles"]
+            trip.leg1_duration_hours = best_route["leg1_duration_hours"]
+            trip.leg2_duration_hours = best_route["leg2_duration_hours"]
+            trip.total_distance_miles = best_route["total_distance_miles"]
+            trip.route_geometry = best_route["route_geometry"]
+            trip.stops = best_route["stops"]
+            trip.daily_logs = best_route["daily_logs"]
+            trip.total_on_duty_hours = best_route["total_on_duty_hours"]
+            trip.total_drive_hours = best_route["total_drive_hours"]
+            trip.hos_compliant = best_route["hos_compliant"]
+            trip.weekly_hours_used = best_route["weekly_hours_used"]
+            trip.weekly_hours_remaining = best_route["weekly_hours_remaining"]
+            
             trip.status = Trip.Status.COMPUTED
             trip.save()
 
