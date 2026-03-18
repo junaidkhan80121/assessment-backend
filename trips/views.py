@@ -16,6 +16,32 @@ from .hos_engine import plan_trip
 logger = logging.getLogger(__name__)
 
 
+def error_payload(code: str, message: str, details=None) -> dict:
+    """Consistent API error response body for frontend consumers."""
+    payload = {
+        "code": code,
+        "message": message,
+    }
+    if details is not None:
+        payload["details"] = details
+    return payload
+
+
+def resolve_location(data: dict, field_name: str) -> dict:
+    """
+    Reuse client-selected coordinates when available to avoid redundant
+    geocoding requests, otherwise geocode the provided location label.
+    """
+    lat = data.get(f"{field_name}_lat")
+    lon = data.get(f"{field_name}_lon")
+    label = data[field_name]
+
+    if lat is not None and lon is not None:
+        return {"lat": lat, "lon": lon, "label": label}
+
+    return geocode_location(label)
+
+
 @extend_schema_view(
     create=extend_schema(
         summary="Create a new trip plan",
@@ -57,7 +83,15 @@ class TripViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         serializer = TripCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        if not serializer.is_valid():
+            return Response(
+                error_payload(
+                    code="validation_error",
+                    message="Please correct the highlighted trip inputs.",
+                    details=serializer.errors,
+                ),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         data = serializer.validated_data
 
         # Create trip in COMPUTING state
@@ -71,9 +105,9 @@ class TripViewSet(viewsets.ModelViewSet):
 
         try:
             # Step 1: Geocode locations
-            current_geo = geocode_location(data["current_location"])
-            pickup_geo = geocode_location(data["pickup_location"])
-            dropoff_geo = geocode_location(data["dropoff_location"])
+            current_geo = resolve_location(data, "current_location")
+            pickup_geo = resolve_location(data, "pickup_location")
+            dropoff_geo = resolve_location(data, "dropoff_location")
 
             trip.current_location_lat = current_geo["lat"]
             trip.current_location_lon = current_geo["lon"]
@@ -192,7 +226,13 @@ class TripViewSet(viewsets.ModelViewSet):
             trip.error_message = str(e)
             trip.save()
             return Response(
-                {"error": str(e), "trip_id": str(trip.id)},
+                {
+                    **error_payload(
+                        code="trip_planning_failed",
+                        message=str(e),
+                    ),
+                    "trip_id": str(trip.id),
+                },
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
         except Exception as e:
@@ -201,6 +241,9 @@ class TripViewSet(viewsets.ModelViewSet):
             trip.error_message = f"Internal error: {str(e)}"
             trip.save()
             return Response(
-                {"error": "An unexpected error occurred. Please try again."},
+                error_payload(
+                    code="internal_error",
+                    message="An unexpected error occurred while computing the trip. Please try again.",
+                ),
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )

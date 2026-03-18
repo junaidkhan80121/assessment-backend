@@ -15,6 +15,7 @@ class DutyEntry:
     start_hour: float    # Absolute hour from trip start (0 = midnight Day 1)
     end_hour: float
     location: str
+    miles: float = 0.0
 
 
 @dataclass
@@ -104,7 +105,7 @@ def plan_trip(
     def add_off_duty(hours: float, location: str) -> None:
         """Off-duty time does NOT count toward the 70-hr limit."""
         state.entries.append(DutyEntry(
-            "OFF_DUTY", state.current_hour, state.current_hour + hours, location
+            "OFF_DUTY", state.current_hour, state.current_hour + hours, location, 0.0
         ))
         state.current_hour += hours
         state.daily_drive_hours = 0.0
@@ -116,7 +117,7 @@ def plan_trip(
         check_70hr_limit(about_to_add=hours)
         state.entries.append(DutyEntry(
             "ON_DUTY_NOT_DRIVING",
-            state.current_hour, state.current_hour + hours, location
+            state.current_hour, state.current_hour + hours, location, 0.0
         ))
         state.current_hour += hours
         state.weekly_hours += hours
@@ -178,7 +179,11 @@ def plan_trip(
 
             check_70hr_limit(about_to_add=max_drive)
             state.entries.append(DutyEntry(
-                "DRIVING", state.current_hour, state.current_hour + max_drive, location
+                "DRIVING",
+                state.current_hour,
+                state.current_hour + max_drive,
+                location,
+                driven_miles,
             ))
             state.current_hour += max_drive
             state.daily_drive_hours += max_drive
@@ -191,7 +196,7 @@ def plan_trip(
     # ── TRIP EXECUTION ────────────────────────────────────────────────────────
 
     # Pre-duty off-duty (midnight to 08:00)
-    state.entries.append(DutyEntry("OFF_DUTY", 0.0, 8.0, current_location))
+    state.entries.append(DutyEntry("OFF_DUTY", 0.0, 8.0, current_location, 0.0))
 
     # Pre-trip inspection: 30 min on-duty not-driving
     state.stops.append(Stop(
@@ -255,7 +260,7 @@ def plan_trip(
 
     # Fill remaining hours of last day with off-duty
     day_end = (int(state.current_hour / 24) + 1) * 24.0
-    state.entries.append(DutyEntry("OFF_DUTY", state.current_hour, day_end, dropoff_location))
+    state.entries.append(DutyEntry("OFF_DUTY", state.current_hour, day_end, dropoff_location, 0.0))
 
     # Build per-day log sheets
     trip_on_duty_hours = state.weekly_hours - current_cycle_used
@@ -322,12 +327,18 @@ def build_daily_logs(
             ce = min(e.end_hour, day_end) - day_start
             if ce - cs < 0.0001:
                 continue  # Skip zero-duration entries
+            original_duration = e.end_hour - e.start_hour
+            clipped_duration = ce - cs
+            clipped_miles = 0.0
+            if original_duration > 0.0001 and e.miles > 0:
+                clipped_miles = e.miles * (clipped_duration / original_duration)
             day_entries.append({
                 "status": e.status,
                 "start": hours_to_hhmm_24(cs),
                 "end": hours_to_hhmm_24(ce),
                 "hours": round(ce - cs, 4),
                 "location": e.location,
+                "miles": round(clipped_miles, 4),
             })
 
         # Sort chronologically and fill any gaps
@@ -345,6 +356,10 @@ def build_daily_logs(
 
         today_on_duty = totals["DRIVING"] + totals["ON_DUTY_NOT_DRIVING"]
         trip_on_duty_so_far += today_on_duty
+        total_miles_driving_today = round(
+            sum(e.get("miles", 0.0) for e in day_entries if e["status"] == "DRIVING"),
+            2,
+        )
 
         on_duty_last_8_days = round(current_cycle_used + trip_on_duty_so_far, 2)
         available_tomorrow = round(max(0.0, 70.0 - on_duty_last_8_days), 2)
@@ -370,6 +385,7 @@ def build_daily_logs(
             "day_number": day_idx + 1,
             "duty_entries": day_entries,
             "totals": {k: round(v, 2) for k, v in totals.items()},
+            "total_miles_driving_today": total_miles_driving_today,
             "remarks": remarks,
             "recap": {
                 "on_duty_today": round(today_on_duty, 2),

@@ -8,14 +8,40 @@ from .models import Trip
 class TripCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating a new trip (input only)."""
 
+    current_location_lat = serializers.FloatField(required=False)
+    current_location_lon = serializers.FloatField(required=False)
+    pickup_location_lat = serializers.FloatField(required=False)
+    pickup_location_lon = serializers.FloatField(required=False)
+    dropoff_location_lat = serializers.FloatField(required=False)
+    dropoff_location_lon = serializers.FloatField(required=False)
+
     class Meta:
         model = Trip
         fields = [
             "current_location",
+            "current_location_lat",
+            "current_location_lon",
             "pickup_location",
+            "pickup_location_lat",
+            "pickup_location_lon",
             "dropoff_location",
+            "dropoff_location_lat",
+            "dropoff_location_lon",
             "current_cycle_used",
         ]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        for prefix in ("current_location", "pickup_location", "dropoff_location"):
+            lat = attrs.get(f"{prefix}_lat")
+            lon = attrs.get(f"{prefix}_lon")
+            if (lat is None) != (lon is None):
+                raise serializers.ValidationError(
+                    {prefix: "Latitude and longitude must be provided together."}
+                )
+
+        return attrs
 
     def validate_current_cycle_used(self, value: float) -> float:
         if value < 0.0 or value > 70.0:
