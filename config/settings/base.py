@@ -124,6 +124,15 @@ REST_FRAMEWORK = {
     },
 }
 
+# ── Caching ───────────────────────────────────────────────────────────────
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "eld-trip-planner",
+        "TIMEOUT": int(os.getenv("DJANGO_CACHE_TIMEOUT", "3600")),
+    }
+}
+
 # ── DRF Spectacular ──────────────────────────────────────────────────────
 SPECTACULAR_SETTINGS = {
     "TITLE": "ELD Trip Planner API",
@@ -165,3 +174,6 @@ ORS_BASE_URL = "https://api.openrouteservice.org"
 
 # Primary: Mapbox Directions for routing
 MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN", "")
+
+GEOCODE_CACHE_TIMEOUT = int(os.getenv("GEOCODE_CACHE_TIMEOUT", "86400"))
+ROUTE_CACHE_TIMEOUT = int(os.getenv("ROUTE_CACHE_TIMEOUT", "21600"))

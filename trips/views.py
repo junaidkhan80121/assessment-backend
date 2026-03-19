@@ -1,8 +1,10 @@
 """
 Trip API views.
 """
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
+from time import perf_counter
 
 from django.db import transaction
 from rest_framework import viewsets, status
@@ -175,10 +177,19 @@ class TripViewSet(viewsets.ModelViewSet):
         )
 
         try:
+            request_started_at = perf_counter()
+
             # Step 1: Geocode locations
-            current_geo = resolve_location(data, "current_location")
-            pickup_geo = resolve_location(data, "pickup_location")
-            dropoff_geo = resolve_location(data, "dropoff_location")
+            geocode_started_at = perf_counter()
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                current_geo_future = executor.submit(resolve_location, data, "current_location")
+                pickup_geo_future = executor.submit(resolve_location, data, "pickup_location")
+                dropoff_geo_future = executor.submit(resolve_location, data, "dropoff_location")
+
+                current_geo = current_geo_future.result()
+                pickup_geo = pickup_geo_future.result()
+                dropoff_geo = dropoff_geo_future.result()
+            logger.info("Trip %s geocoding completed in %.2fs", trip.id, perf_counter() - geocode_started_at)
 
             trip.current_location_lat = current_geo["lat"]
             trip.current_location_lon = current_geo["lon"]
@@ -187,21 +198,33 @@ class TripViewSet(viewsets.ModelViewSet):
             trip.dropoff_location_lat = dropoff_geo["lat"]
             trip.dropoff_location_lon = dropoff_geo["lon"]
 
-            # Step 2: Get route for Leg 1 (Current -> Pickup)
-            leg1_route = get_route(
-                current_geo["lon"], current_geo["lat"],
-                pickup_geo["lon"], pickup_geo["lat"],
-                alternatives=False
-            )
-            
-            # Step 3: Get one or more alternative routes for Leg 2 (Pickup -> Dropoff).
-            # The routing backend (Mapbox) will return multiple candidate routes
-            # when alternatives=True. We will mark the fastest one and still
-            # expose all options to the client.
-            leg2_variants = get_route(
-                pickup_geo["lon"], pickup_geo["lat"],
-                dropoff_geo["lon"], dropoff_geo["lat"],
-                alternatives=True,
+            # Step 2: Fetch both route legs concurrently to reduce end-to-end latency.
+            routing_started_at = perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                leg1_route_future = executor.submit(
+                    get_route,
+                    current_geo["lon"],
+                    current_geo["lat"],
+                    pickup_geo["lon"],
+                    pickup_geo["lat"],
+                    False,
+                )
+                leg2_variants_future = executor.submit(
+                    get_route,
+                    pickup_geo["lon"],
+                    pickup_geo["lat"],
+                    dropoff_geo["lon"],
+                    dropoff_geo["lat"],
+                    True,
+                )
+
+                leg1_route = leg1_route_future.result()
+                leg2_variants = leg2_variants_future.result()
+            logger.info(
+                "Trip %s routing completed in %.2fs with %s variant(s)",
+                trip.id,
+                perf_counter() - routing_started_at,
+                len(leg2_variants),
             )
             
             route_options = []
@@ -221,6 +244,7 @@ class TripViewSet(viewsets.ModelViewSet):
                 
                 # Step 4: Run HOS engine for this specific variant
                 try:
+                    hos_started_at = perf_counter()
                     hos_result = plan_trip(
                         total_distance_miles=total_distance,
                         leg1_miles=leg1_miles,
@@ -237,6 +261,12 @@ class TripViewSet(viewsets.ModelViewSet):
                         current_location=data["current_location"],
                         current_lat=current_geo["lat"],
                         current_lon=current_geo["lon"],
+                    )
+                    logger.info(
+                        "Trip %s HOS planning for variant %s completed in %.2fs",
+                        trip.id,
+                        i,
+                        perf_counter() - hos_started_at,
                     )
                     enriched_stops = attach_stop_coordinates(
                         hos_result["stops"],
@@ -299,6 +329,7 @@ class TripViewSet(viewsets.ModelViewSet):
             
             trip.status = Trip.Status.COMPUTED
             trip.save()
+            logger.info("Trip %s fully computed in %.2fs", trip.id, perf_counter() - request_started_at)
 
             output_serializer = TripDetailSerializer(trip)
             return Response(output_serializer.data, status=status.HTTP_201_CREATED)

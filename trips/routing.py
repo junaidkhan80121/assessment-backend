@@ -5,10 +5,18 @@ local development without API keys.
 """
 import math
 import logging
+import hashlib
 import requests
 from django.conf import settings
+from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
+
+
+def _cache_key(prefix: str, *parts: object) -> str:
+    serialized = "|".join(str(part) for part in parts)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return f"trips:{prefix}:{digest}"
 
 
 def _decode_polyline(encoded: str) -> list[list[float]]:
@@ -61,6 +69,12 @@ def geocode_location(query: str) -> dict:
     Geocode a location string to lat/lon using a provider chain.
     Returns {"lat": float, "lon": float, "label": str} or raises ValueError.
     """
+    normalized_query = query.strip()
+    cache_key = _cache_key("geocode", normalized_query.lower())
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     api_key = getattr(settings, "ORS_API_KEY", "")
     if api_key:
         try:
@@ -80,7 +94,9 @@ def geocode_location(query: str) -> dict:
             if data.get("features"):
                 coords = data["features"][0]["geometry"]["coordinates"]
                 label = data["features"][0]["properties"].get("label", query)
-                return {"lat": coords[1], "lon": coords[0], "label": label}
+                result = {"lat": coords[1], "lon": coords[0], "label": label}
+                cache.set(cache_key, result, timeout=getattr(settings, "GEOCODE_CACHE_TIMEOUT", 86400))
+                return result
         except requests.RequestException as e:
             logger.warning("ORS geocode failed for %s: %s", query, e)
 
@@ -103,16 +119,19 @@ def geocode_location(query: str) -> dict:
         data = resp.json()
         if data:
             top_result = data[0]
-            return {
+            result = {
                 "lat": float(top_result["lat"]),
                 "lon": float(top_result["lon"]),
                 "label": top_result.get("display_name", query),
             }
+            cache.set(cache_key, result, timeout=getattr(settings, "GEOCODE_CACHE_TIMEOUT", 86400))
+            return result
     except requests.RequestException as e:
         logger.warning("Nominatim geocode failed for %s: %s", query, e)
 
     fallback = _fallback_geocode(query)
     if fallback is not None:
+        cache.set(cache_key, fallback, timeout=getattr(settings, "GEOCODE_CACHE_TIMEOUT", 86400))
         return fallback
 
     raise ValueError(f"Could not geocode location: {query}")
@@ -135,34 +154,52 @@ def get_route(
         "instructions": list,
     }.
     """
+    cache_key = _cache_key(
+        "route",
+        round(start_lon, 5),
+        round(start_lat, 5),
+        round(end_lon, 5),
+        round(end_lat, 5),
+        alternatives,
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     access_token = getattr(settings, "MAPBOX_ACCESS_TOKEN", "")
 
     if access_token:
         try:
-            return _get_mapbox_route(
+            result = _get_mapbox_route(
                 start_lon=start_lon,
                 start_lat=start_lat,
                 end_lon=end_lon,
                 end_lat=end_lat,
                 alternatives=alternatives,
             )
+            cache.set(cache_key, result, timeout=getattr(settings, "ROUTE_CACHE_TIMEOUT", 21600))
+            return result
         except (requests.RequestException, ValueError) as e:
             logger.warning("Mapbox route failed, falling back to ORS: %s", e)
 
     ors_api_key = getattr(settings, "ORS_API_KEY", "")
     if ors_api_key:
         try:
-            return _get_ors_route(
+            result = _get_ors_route(
                 start_lon=start_lon,
                 start_lat=start_lat,
                 end_lon=end_lon,
                 end_lat=end_lat,
                 alternatives=alternatives,
             )
+            cache.set(cache_key, result, timeout=getattr(settings, "ROUTE_CACHE_TIMEOUT", 21600))
+            return result
         except (requests.RequestException, ValueError) as e:
             logger.warning("ORS route failed, falling back to local estimate: %s", e)
 
-    return _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
+    result = _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
+    cache.set(cache_key, result, timeout=getattr(settings, "ROUTE_CACHE_TIMEOUT", 21600))
+    return result
 
 
 def _get_mapbox_route(
