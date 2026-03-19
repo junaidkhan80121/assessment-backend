@@ -28,6 +28,7 @@ class Stop:
     arrival_hour: float  # Absolute hour from trip start
     duration_minutes: int
     description: str
+    progress_miles: float = 0.0
 
 
 @dataclass
@@ -45,6 +46,7 @@ class HOSState:
     # Incremented by EVERY on-duty event (driving + not-driving).
     # Checked against 70.0 after EVERY increment.
     weekly_hours: float = 0.0        # Set to current_cycle_used at init
+    trip_miles_completed: float = 0.0
 
     entries: List[DutyEntry] = field(default_factory=list)
     stops: List[Stop] = field(default_factory=list)
@@ -139,7 +141,7 @@ def plan_trip(
             # Insert 30-min break if we've hit 8 cumulative drive hours
             if until_break <= 0.001:
                 state.stops.append(Stop(
-                    "BREAK", location, 0, 0, state.current_hour, 30, "30-min rest break"
+                    "BREAK", location, 0, 0, state.current_hour, 30, "30-min rest break", state.trip_miles_completed
                 ))
                 add_on_duty_not_driving(0.5, location)
                 state.hours_since_break = 0.0
@@ -169,7 +171,7 @@ def plan_trip(
                 # Hit 11-hr or 14-hr window — mandatory 10-hr rest
                 state.stops.append(Stop(
                     "REST", location, 0, 0, state.current_hour, 600,
-                    "10-hr mandatory off-duty rest"
+                    "10-hr mandatory off-duty rest", state.trip_miles_completed
                 ))
                 add_off_duty(10.0, location)
                 continue
@@ -189,6 +191,7 @@ def plan_trip(
             state.daily_drive_hours += max_drive
             state.hours_since_break += max_drive
             state.weekly_hours += max_drive
+            state.trip_miles_completed += driven_miles
 
             remaining_hours -= max_drive
             remaining_miles -= driven_miles
@@ -201,7 +204,7 @@ def plan_trip(
     # Pre-trip inspection: 30 min on-duty not-driving
     state.stops.append(Stop(
         "CURRENT", current_location, current_lat, current_lon,
-        state.current_hour, 30, "Pre-trip inspection"
+        state.current_hour, 30, "Pre-trip inspection", 0.0
     ))
     add_on_duty_not_driving(0.5, current_location)
 
@@ -220,7 +223,7 @@ def plan_trip(
         if fuel_odometer >= 1000.0 and leg1_driven < leg1_miles - 0.001:
             state.stops.append(Stop(
                 "FUEL", "En route – Fuel Stop", 0.0, 0.0,
-                state.current_hour, 30, "Fuel stop (1,000-mi interval)"
+                state.current_hour, 30, "Fuel stop (1,000-mi interval)", state.trip_miles_completed
             ))
             add_on_duty_not_driving(0.5, "Fuel Stop")
             fuel_odometer = 0.0
@@ -228,7 +231,7 @@ def plan_trip(
     # Pickup: 1 hr on-duty not-driving
     state.stops.append(Stop(
         "PICKUP", pickup_location, pickup_lat, pickup_lon,
-        state.current_hour, 60, "Pickup – 1 hr on-duty"
+        state.current_hour, 60, "Pickup – 1 hr on-duty", state.trip_miles_completed
     ))
     add_on_duty_not_driving(1.0, pickup_location)
 
@@ -246,7 +249,7 @@ def plan_trip(
         if fuel_odometer >= 1000.0 and leg2_driven < leg2_miles - 0.001:
             state.stops.append(Stop(
                 "FUEL", "En route – Fuel Stop", 0.0, 0.0,
-                state.current_hour, 30, "Fuel stop (1,000-mi interval)"
+                state.current_hour, 30, "Fuel stop (1,000-mi interval)", state.trip_miles_completed
             ))
             add_on_duty_not_driving(0.5, "Fuel Stop")
             fuel_odometer = 0.0
@@ -254,7 +257,7 @@ def plan_trip(
     # Dropoff: 1 hr on-duty not-driving
     state.stops.append(Stop(
         "DROPOFF", dropoff_location, dropoff_lat, dropoff_lon,
-        state.current_hour, 60, "Dropoff – 1 hr on-duty"
+        state.current_hour, 60, "Dropoff – 1 hr on-duty", state.trip_miles_completed
     ))
     add_on_duty_not_driving(1.0, dropoff_location)
 
@@ -295,6 +298,7 @@ def _stop_to_dict(stop: Stop) -> dict:
         "arrival_hour": stop.arrival_hour,
         "duration_minutes": stop.duration_minutes,
         "description": stop.description,
+        "progress_miles": round(stop.progress_miles, 2),
     }
 
 

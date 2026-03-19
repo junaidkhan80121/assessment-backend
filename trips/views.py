@@ -2,6 +2,7 @@
 Trip API views.
 """
 import logging
+import math
 
 from django.db import transaction
 from rest_framework import viewsets, status
@@ -40,6 +41,69 @@ def resolve_location(data: dict, field_name: str) -> dict:
         return {"lat": lat, "lon": lon, "label": label}
 
     return geocode_location(label)
+
+
+def haversine_miles(point_a: list[float], point_b: list[float]) -> float:
+    lat1, lon1 = math.radians(point_a[0]), math.radians(point_a[1])
+    lat2, lon2 = math.radians(point_b[0]), math.radians(point_b[1])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 3958.8 * (2 * math.asin(math.sqrt(a)))
+
+
+def interpolate_route_position(route_geometry: list[list[float]], progress_ratio: float) -> tuple[float, float] | None:
+    if len(route_geometry) < 2:
+        return None
+
+    clamped_ratio = max(0.0, min(1.0, progress_ratio))
+    segment_lengths: list[float] = []
+    total_length = 0.0
+
+    for index in range(len(route_geometry) - 1):
+        segment_length = haversine_miles(route_geometry[index], route_geometry[index + 1])
+        segment_lengths.append(segment_length)
+        total_length += segment_length
+
+    if total_length <= 0.001:
+        return route_geometry[0][0], route_geometry[0][1]
+
+    target_distance = total_length * clamped_ratio
+    traversed = 0.0
+
+    for index, segment_length in enumerate(segment_lengths):
+        next_traversed = traversed + segment_length
+        if target_distance <= next_traversed or index == len(segment_lengths) - 1:
+            local_ratio = 0.0 if segment_length <= 0.001 else (target_distance - traversed) / segment_length
+            start = route_geometry[index]
+            end = route_geometry[index + 1]
+            lat = start[0] + (end[0] - start[0]) * local_ratio
+            lon = start[1] + (end[1] - start[1]) * local_ratio
+            return lat, lon
+        traversed = next_traversed
+
+    last = route_geometry[-1]
+    return last[0], last[1]
+
+
+def attach_stop_coordinates(stops: list[dict], route_geometry: list[list[float]], total_distance_miles: float) -> list[dict]:
+    enriched_stops: list[dict] = []
+
+    for stop in stops:
+        enriched = dict(stop)
+        if (
+            enriched.get("lat", 0.0) == 0.0
+            and enriched.get("lon", 0.0) == 0.0
+            and route_geometry
+            and total_distance_miles > 0
+        ):
+            progress_ratio = enriched.get("progress_miles", 0.0) / total_distance_miles
+            interpolated = interpolate_route_position(route_geometry, progress_ratio)
+            if interpolated is not None:
+                enriched["lat"], enriched["lon"] = interpolated
+        enriched_stops.append(enriched)
+
+    return enriched_stops
 
 
 @extend_schema_view(
@@ -167,6 +231,11 @@ class TripViewSet(viewsets.ModelViewSet):
                         current_lat=current_geo["lat"],
                         current_lon=current_geo["lon"],
                     )
+                    enriched_stops = attach_stop_coordinates(
+                        hos_result["stops"],
+                        geometry,
+                        total_distance,
+                    )
                     
                     route_options.append({
                         "id": i,
@@ -177,7 +246,7 @@ class TripViewSet(viewsets.ModelViewSet):
                         "leg2_duration_hours": leg2_duration,
                         "route_geometry": geometry,
                         "route_instructions": instructions,
-                        "stops": hos_result["stops"],
+                        "stops": enriched_stops,
                         "daily_logs": hos_result["daily_logs"],
                         "total_on_duty_hours": hos_result["total_on_duty_hours"],
                         "total_drive_hours": hos_result["total_drive_hours"],

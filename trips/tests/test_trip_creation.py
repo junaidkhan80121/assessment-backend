@@ -123,3 +123,79 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
     assert len(data["route_options"]) == 2
     assert any(option["is_fastest"] for option in data["route_options"])
     assert len(data["route_instructions"]) == 2
+
+
+@pytest.mark.django_db
+def test_create_trip_projects_generated_stop_markers_onto_route():
+    client = APIClient()
+
+    payload = {
+        "current_location": "Chicago, IL",
+        "current_location_lat": 41.8781,
+        "current_location_lon": -87.6298,
+        "pickup_location": "Indianapolis, IN",
+        "pickup_location_lat": 39.7684,
+        "pickup_location_lon": -86.1581,
+        "dropoff_location": "Nashville, TN",
+        "dropoff_location_lat": 36.1627,
+        "dropoff_location_lon": -86.7816,
+        "current_cycle_used": 12.0,
+    }
+
+    def route_stub(*_args, alternatives=False, **_kwargs):
+        route = {
+            "distance_miles": 200.0,
+            "duration_hours": 4.0,
+            "geometry": [
+                [41.8781, -87.6298],
+                [40.9, -87.1],
+                [39.7684, -86.1581],
+                [38.3, -86.5],
+                [36.1627, -86.7816],
+            ],
+            "instructions": [],
+        }
+        return [route] if alternatives else route
+
+    def plan_trip_stub(**_kwargs):
+        return {
+            "stops": [
+                {
+                    "type": "CURRENT",
+                    "location": "Chicago, IL",
+                    "lat": 41.8781,
+                    "lon": -87.6298,
+                    "arrival_hour": 8.0,
+                    "duration_minutes": 30,
+                    "description": "Pre-trip inspection",
+                    "progress_miles": 0.0,
+                },
+                {
+                    "type": "BREAK",
+                    "location": "En route (Leg 1)",
+                    "lat": 0.0,
+                    "lon": 0.0,
+                    "arrival_hour": 12.0,
+                    "duration_minutes": 30,
+                    "description": "30-min rest break",
+                    "progress_miles": 120.0,
+                },
+            ],
+            "daily_logs": [],
+            "total_on_duty_hours": 8.0,
+            "total_drive_hours": 7.0,
+            "hos_compliant": True,
+            "weekly_hours_used": 20.0,
+            "weekly_hours_remaining": 50.0,
+        }
+
+    with patch("trips.views.geocode_location"), patch(
+        "trips.views.get_route", side_effect=route_stub
+    ), patch("trips.views.plan_trip", side_effect=plan_trip_stub):
+        response = client.post("/api/trips/", payload, format="json")
+
+    assert response.status_code == 201
+    data = response.json()
+    projected_stop = next(stop for stop in data["stops"] if stop["type"] == "BREAK")
+    assert projected_stop["lat"] != 0.0
+    assert projected_stop["lon"] != 0.0
