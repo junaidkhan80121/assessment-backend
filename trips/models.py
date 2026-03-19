@@ -45,6 +45,7 @@ class Trip(models.Model):
     # Route data from OpenRouteService
     route_geometry = models.JSONField(default=list, blank=True)
     route_options = models.JSONField(default=list, blank=True)
+    route_instructions = models.JSONField(default=list, blank=True)
     total_distance_miles = models.FloatField(default=0.0)
     leg1_miles = models.FloatField(default=0.0)
     leg2_miles = models.FloatField(default=0.0)

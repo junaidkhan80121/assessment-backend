@@ -3,10 +3,10 @@ Routing utilities: Mapbox Directions for routing, with OpenRouteService
 geocoding as an optional fallback and simple math-based fallbacks for
 local development without API keys.
 """
+import math
 import logging
 import requests
 from django.conf import settings
-import math
 
 logger = logging.getLogger(__name__)
 
@@ -58,38 +58,64 @@ ORS_BASE_URL = "https://api.openrouteservice.org"
 
 def geocode_location(query: str) -> dict:
     """
-    Geocode a location string to lat/lon using OpenRouteService.
+    Geocode a location string to lat/lon using a provider chain.
     Returns {"lat": float, "lon": float, "label": str} or raises ValueError.
     """
     api_key = getattr(settings, "ORS_API_KEY", "")
-    if not api_key:
-        # Fallback: use a simple estimation for development
-        return _fallback_geocode(query)
+    if api_key:
+        try:
+            resp = requests.get(
+                f"{ORS_BASE_URL}/geocode/search",
+                params={
+                    "api_key": api_key,
+                    "text": query,
+                    "size": 1,
+                    "boundary.country": "US",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("features"):
+                coords = data["features"][0]["geometry"]["coordinates"]
+                label = data["features"][0]["properties"].get("label", query)
+                return {"lat": coords[1], "lon": coords[0], "label": label}
+        except requests.RequestException as e:
+            logger.warning("ORS geocode failed for %s: %s", query, e)
 
     try:
         resp = requests.get(
-            f"{ORS_BASE_URL}/geocode/search",
+            "https://nominatim.openstreetmap.org/search",
             params={
-                "api_key": api_key,
-                "text": query,
-                "size": 1,
-                "boundary.country": "US",
+                "format": "jsonv2",
+                "q": query,
+                "countrycodes": "us",
+                "limit": 1,
+            },
+            headers={
+                "User-Agent": "eld-trip-planner/1.0",
+                "Accept": "application/json",
             },
             timeout=10,
         )
         resp.raise_for_status()
         data = resp.json()
-
-        if not data.get("features"):
-            raise ValueError(f"Could not geocode location: {query}")
-
-        coords = data["features"][0]["geometry"]["coordinates"]
-        label = data["features"][0]["properties"].get("label", query)
-        return {"lat": coords[1], "lon": coords[0], "label": label}
-
+        if data:
+            top_result = data[0]
+            return {
+                "lat": float(top_result["lat"]),
+                "lon": float(top_result["lon"]),
+                "label": top_result.get("display_name", query),
+            }
     except requests.RequestException as e:
-        logger.warning("ORS geocode failed for %s: %s", query, e)
-        return _fallback_geocode(query)
+        logger.warning("Nominatim geocode failed for %s: %s", query, e)
+
+    fallback = _fallback_geocode(query)
+    if fallback is not None:
+        return fallback
+
+    raise ValueError(f"Could not geocode location: {query}")
 
 
 def get_route(
@@ -101,63 +127,209 @@ def get_route(
     Get driving route between two points using Mapbox Directions API.
     If alternatives=False, returns dict.
     If alternatives=True, returns list of dicts.
-    Dict format: {"distance_miles": float, "duration_hours": float, "geometry": list}.
+    Dict format:
+    {
+        "distance_miles": float,
+        "duration_hours": float,
+        "geometry": list,
+        "instructions": list,
+    }.
     """
     access_token = getattr(settings, "MAPBOX_ACCESS_TOKEN", "")
-    # If no Mapbox token is configured at all, fall back to the simple
-    # straight-line approximation so local development still works.
-    if not access_token:
-        return _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
 
-    try:
-        # Mapbox Directions API: https://api.mapbox.com/directions/v5/mapbox/driving-traffic
-        # We request full GeoJSON geometry and let Mapbox generate the route.
-        coordinates = f"{start_lon},{start_lat};{end_lon},{end_lat}"
-        url = f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/{coordinates}"
+    if access_token:
+        try:
+            return _get_mapbox_route(
+                start_lon=start_lon,
+                start_lat=start_lat,
+                end_lon=end_lon,
+                end_lat=end_lat,
+                alternatives=alternatives,
+            )
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("Mapbox route failed, falling back to ORS: %s", e)
 
-        params: dict = {
-            "access_token": access_token,
-            "geometries": "geojson",
-            "overview": "full",
-            "steps": "false",
-            "alternatives": "true" if alternatives else "false",
-        }
+    ors_api_key = getattr(settings, "ORS_API_KEY", "")
+    if ors_api_key:
+        try:
+            return _get_ors_route(
+                start_lon=start_lon,
+                start_lat=start_lat,
+                end_lon=end_lon,
+                end_lat=end_lat,
+                alternatives=alternatives,
+            )
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("ORS route failed, falling back to local estimate: %s", e)
 
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+    return _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
 
-        results: list[dict] = []
-        for route in data.get("routes", []):
-            distance_meters = route.get("distance", 0.0)
-            duration_seconds = route.get("duration", 0.0)
 
-            geometry = route.get("geometry", {})
-            if isinstance(geometry, dict):
-                raw_coords = geometry.get("coordinates", [])
-                coords = [[c[1], c[0]] for c in raw_coords]  # [lat, lon]
-            else:
-                coords = []
+def _get_mapbox_route(
+    start_lon: float,
+    start_lat: float,
+    end_lon: float,
+    end_lat: float,
+    alternatives: bool,
+) -> dict | list[dict]:
+    coordinates = f"{start_lon},{start_lat};{end_lon},{end_lat}"
+    url = f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/{coordinates}"
 
-            results.append(
+    params: dict = {
+        "access_token": getattr(settings, "MAPBOX_ACCESS_TOKEN", ""),
+        "geometries": "geojson",
+        "overview": "full",
+        "steps": "true",
+        "alternatives": "true" if alternatives else "false",
+    }
+
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    routes = data.get("routes", [])
+    if not routes:
+        raise ValueError("Mapbox Directions returned no routes for the given coordinates.")
+
+    results = []
+    for route in routes:
+        geometry = route.get("geometry", {})
+        raw_coords = geometry.get("coordinates", []) if isinstance(geometry, dict) else []
+        results.append(
+            {
+                "distance_miles": round(route.get("distance", 0.0) / 1609.34, 2),
+                "duration_hours": round(route.get("duration", 0.0) / 3600, 2),
+                "geometry": [[c[1], c[0]] for c in raw_coords],
+                "instructions": _mapbox_instructions(route),
+            }
+        )
+
+    return results if alternatives else results[0]
+
+
+def _get_ors_route(
+    start_lon: float,
+    start_lat: float,
+    end_lon: float,
+    end_lat: float,
+    alternatives: bool,
+) -> dict | list[dict]:
+    headers = {
+        "Authorization": getattr(settings, "ORS_API_KEY", ""),
+        "Content-Type": "application/json",
+    }
+    body = {
+        "coordinates": [[start_lon, start_lat], [end_lon, end_lat]],
+        "instructions": True,
+        "instructions_format": "text",
+        "geometry": True,
+        "elevation": False,
+        "alternative_routes": {
+            "target_count": 3 if alternatives else 1,
+            "weight_factor": 1.4,
+            "share_factor": 0.6,
+        } if alternatives else None,
+    }
+    if not alternatives:
+        body.pop("alternative_routes")
+
+    resp = requests.post(
+        f"{ORS_BASE_URL}/v2/directions/driving-hgv/geojson",
+        json=body,
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    features = data.get("features", [])
+    if not features:
+        raise ValueError("OpenRouteService returned no routes for the given coordinates.")
+
+    results = []
+    for feature in features:
+        props = feature.get("properties", {}) or {}
+        summary = props.get("summary", {}) or {}
+        geometry = feature.get("geometry", {}) or {}
+        raw_coords = geometry.get("coordinates", []) if geometry.get("type") == "LineString" else []
+        segments = props.get("segments", []) or []
+        results.append(
+            {
+                "distance_miles": round(summary.get("distance", 0.0) / 1609.34, 2),
+                "duration_hours": round(summary.get("duration", 0.0) / 3600, 2),
+                "geometry": [[c[1], c[0]] for c in raw_coords],
+                "instructions": _ors_instructions(segments, raw_coords),
+            }
+        )
+
+    return results if alternatives else results[0]
+
+
+def _mapbox_instructions(route: dict) -> list[dict]:
+    instructions: list[dict] = []
+    cumulative_distance = 0.0
+    cumulative_duration = 0.0
+
+    for leg in route.get("legs", []):
+        for step in leg.get("steps", []):
+            maneuver = step.get("maneuver", {})
+            location = maneuver.get("location", [])
+            step_distance_miles = round(step.get("distance", 0.0) / 1609.34, 2)
+            step_duration_hours = round(step.get("duration", 0.0) / 3600, 2)
+            cumulative_distance += step_distance_miles
+            cumulative_duration += step_duration_hours
+            instructions.append(
                 {
-                    "distance_miles": round(distance_meters / 1609.34, 2),
-                    "duration_hours": round(duration_seconds / 3600, 2),
-                    "geometry": coords,
+                    "text": maneuver.get("instruction") or "Continue on the route",
+                    "distance_miles": step_distance_miles,
+                    "duration_hours": step_duration_hours,
+                    "road_name": step.get("name", ""),
+                    "maneuver_type": maneuver.get("type", "continue"),
+                    "maneuver_modifier": maneuver.get("modifier", ""),
+                    "location": {
+                        "lat": location[1] if len(location) > 1 else None,
+                        "lon": location[0] if len(location) > 1 else None,
+                    },
+                    "cumulative_distance_miles": round(cumulative_distance, 2),
+                    "cumulative_duration_hours": round(cumulative_duration, 2),
                 }
             )
 
-        if not results:
-            raise ValueError("Mapbox Directions returned no routes for the given coordinates.")
-
-        return results if alternatives else results[0]
-
-    except requests.RequestException as e:
-        logger.warning("Mapbox route HTTP failure: %s", e)
-        raise ValueError("Routing service is temporarily unavailable, please try again.")
+    return instructions
 
 
-def _fallback_geocode(query: str) -> dict:
+def _ors_instructions(segments: list[dict], raw_coords: list[list[float]]) -> list[dict]:
+    instructions: list[dict] = []
+    cumulative_distance = 0.0
+    cumulative_duration = 0.0
+
+    for segment in segments:
+        for step in segment.get("steps", []):
+            step_distance_miles = round(step.get("distance", 0.0) / 1609.34, 2)
+            step_duration_hours = round(step.get("duration", 0.0) / 3600, 2)
+            cumulative_distance += step_distance_miles
+            cumulative_duration += step_duration_hours
+            waypoint_index = step.get("way_points", [None])[0]
+            coord = raw_coords[waypoint_index] if isinstance(waypoint_index, int) and 0 <= waypoint_index < len(raw_coords) else [None, None]
+            instructions.append(
+                {
+                    "text": step.get("instruction") or "Continue on the route",
+                    "distance_miles": step_distance_miles,
+                    "duration_hours": step_duration_hours,
+                    "road_name": step.get("name", ""),
+                    "maneuver_type": str(step.get("type", "continue")),
+                    "maneuver_modifier": "",
+                    "location": {
+                        "lat": coord[1] if len(coord) > 1 else None,
+                        "lon": coord[0] if len(coord) > 1 else None,
+                    },
+                    "cumulative_distance_miles": round(cumulative_distance, 2),
+                    "cumulative_duration_hours": round(cumulative_duration, 2),
+                }
+            )
+
+    return instructions
+
+
+def _fallback_geocode(query: str) -> dict | None:
     """
     Simple fallback geocoding for known US cities.
     Used when ORS API key is not configured.
@@ -202,8 +374,7 @@ def _fallback_geocode(query: str) -> dict:
         if city_name in query_lower:
             return {"lat": coords["lat"], "lon": coords["lon"], "label": query}
 
-    # Default to geographic center of US
-    return {"lat": 39.8283, "lon": -98.5795, "label": query}
+    return None
 
 
 def _fallback_route(
@@ -238,10 +409,57 @@ def _fallback_route(
         [end_lat, end_lon],
     ]
 
+    first_leg_distance = round(road_distance * 0.45, 2)
+    second_leg_distance = round(road_distance * 0.4, 2)
+    final_leg_distance = round(max(road_distance - first_leg_distance - second_leg_distance, 0.01), 2)
+    first_leg_duration = round(duration_hours * 0.45, 2)
+    second_leg_duration = round(duration_hours * 0.4, 2)
+    final_leg_duration = round(max(duration_hours - first_leg_duration - second_leg_duration, 0.01), 2)
+
+    fallback_instructions = [
+        {
+            "text": "Depart from the current location and follow the planned highway route.",
+            "distance_miles": first_leg_distance,
+            "duration_hours": first_leg_duration,
+            "road_name": "",
+            "maneuver_type": "depart",
+            "maneuver_modifier": "",
+            "location": {"lat": start_lat, "lon": start_lon},
+            "cumulative_distance_miles": first_leg_distance,
+            "cumulative_duration_hours": first_leg_duration,
+        },
+        {
+            "text": "Continue along the main route toward the destination.",
+            "distance_miles": second_leg_distance,
+            "duration_hours": second_leg_duration,
+            "road_name": "",
+            "maneuver_type": "continue",
+            "maneuver_modifier": "",
+            "location": {
+                "lat": round((start_lat + end_lat) / 2, 6),
+                "lon": round((start_lon + end_lon) / 2, 6),
+            },
+            "cumulative_distance_miles": round(first_leg_distance + second_leg_distance, 2),
+            "cumulative_duration_hours": round(first_leg_duration + second_leg_duration, 2),
+        },
+        {
+            "text": "Arrive at the destination.",
+            "distance_miles": final_leg_distance,
+            "duration_hours": final_leg_duration,
+            "road_name": "",
+            "maneuver_type": "arrive",
+            "maneuver_modifier": "",
+            "location": {"lat": end_lat, "lon": end_lon},
+            "cumulative_distance_miles": round(road_distance, 2),
+            "cumulative_duration_hours": round(duration_hours, 2),
+        },
+    ]
+
     route_1 = {
         "distance_miles": round(road_distance, 2),
         "duration_hours": round(duration_hours, 2),
         "geometry": geometry,
+        "instructions": fallback_instructions,
     }
     
     if not alternatives:
@@ -255,6 +473,7 @@ def _fallback_route(
             [start_lat + (dlat * 0.5) + 0.1, start_lon + (dlon * 0.5) - 0.1],
             [end_lat, end_lon],
         ],
+        "instructions": fallback_instructions,
     }
     
     route_3 = {
@@ -265,6 +484,7 @@ def _fallback_route(
             [start_lat + (dlat * 0.5) - 0.2, start_lon + (dlon * 0.5) + 0.1],
             [end_lat, end_lon],
         ],
+        "instructions": fallback_instructions,
     }
 
     return [route_1, route_2, route_3]

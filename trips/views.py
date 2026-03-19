@@ -143,6 +143,10 @@ class TripViewSet(viewsets.ModelViewSet):
                 leg2_duration = leg2_route["duration_hours"]
                 total_distance = leg1_miles + leg2_miles
                 geometry = leg1_route["geometry"] + leg2_route["geometry"]
+                instructions = [
+                    *leg1_route.get("instructions", []),
+                    *leg2_route.get("instructions", []),
+                ]
                 
                 # Step 4: Run HOS engine for this specific variant
                 try:
@@ -172,6 +176,7 @@ class TripViewSet(viewsets.ModelViewSet):
                         "leg1_duration_hours": leg1_duration,
                         "leg2_duration_hours": leg2_duration,
                         "route_geometry": geometry,
+                        "route_instructions": instructions,
                         "stops": hos_result["stops"],
                         "daily_logs": hos_result["daily_logs"],
                         "total_on_duty_hours": hos_result["total_on_duty_hours"],
@@ -201,6 +206,7 @@ class TripViewSet(viewsets.ModelViewSet):
             best_route = route_options[fastest_index]
             
             trip.route_options = route_options
+            trip.route_instructions = best_route["route_instructions"]
             trip.leg1_miles = best_route["leg1_miles"]
             trip.leg2_miles = best_route["leg2_miles"]
             trip.leg1_duration_hours = best_route["leg1_duration_hours"]

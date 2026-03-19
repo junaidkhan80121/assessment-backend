@@ -28,11 +28,17 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
                     "distance_miles": 300.0,
                     "duration_hours": 5.5,
                     "geometry": [[39.7684, -86.1581], [36.1627, -86.7816]],
+                    "instructions": [
+                        {"text": "Head south", "distance_miles": 300.0, "duration_hours": 5.5, "road_name": "I-65", "maneuver_type": "continue", "maneuver_modifier": "", "location": {"lat": 39.7684, "lon": -86.1581}, "cumulative_distance_miles": 300.0, "cumulative_duration_hours": 5.5},
+                    ],
                 },
                 {
                     "distance_miles": 330.0,
                     "duration_hours": 5.9,
                     "geometry": [[39.7684, -86.1581], [36.45, -87.1], [36.1627, -86.7816]],
+                    "instructions": [
+                        {"text": "Take the alternate route", "distance_miles": 330.0, "duration_hours": 5.9, "road_name": "I-65 Alt", "maneuver_type": "continue", "maneuver_modifier": "", "location": {"lat": 39.7684, "lon": -86.1581}, "cumulative_distance_miles": 330.0, "cumulative_duration_hours": 5.9},
+                    ],
                 },
             ]
 
@@ -40,6 +46,9 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
             "distance_miles": 180.0,
             "duration_hours": 3.2,
             "geometry": [[41.8781, -87.6298], [39.7684, -86.1581]],
+            "instructions": [
+                {"text": "Leave Chicago", "distance_miles": 180.0, "duration_hours": 3.2, "road_name": "I-90", "maneuver_type": "depart", "maneuver_modifier": "", "location": {"lat": 41.8781, "lon": -87.6298}, "cumulative_distance_miles": 180.0, "cumulative_duration_hours": 3.2},
+            ],
         }
 
     def plan_trip_stub(**kwargs):
@@ -113,3 +122,4 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
     data = response.json()
     assert len(data["route_options"]) == 2
     assert any(option["is_fastest"] for option in data["route_options"])
+    assert len(data["route_instructions"]) == 2
