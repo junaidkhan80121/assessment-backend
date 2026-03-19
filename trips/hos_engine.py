@@ -317,6 +317,7 @@ def build_daily_logs(
     total_days = int(max(e.end_hour for e in entries) / 24) + 1
     logs = []
     trip_on_duty_so_far = 0.0
+    on_duty_history: list[float] = []
 
     for day_idx in range(total_days):
         day_start = float(day_idx * 24)
@@ -360,13 +361,18 @@ def build_daily_logs(
 
         today_on_duty = totals["DRIVING"] + totals["ON_DUTY_NOT_DRIVING"]
         trip_on_duty_so_far += today_on_duty
+        on_duty_history.append(round(today_on_duty, 2))
         total_miles_driving_today = round(
             sum(e.get("miles", 0.0) for e in day_entries if e["status"] == "DRIVING"),
             2,
         )
 
+        on_duty_last_5_days = round(sum(on_duty_history[-5:]), 2)
+        on_duty_last_7_days = round(sum(on_duty_history[-7:]), 2)
         on_duty_last_8_days = round(current_cycle_used + trip_on_duty_so_far, 2)
         available_tomorrow = round(max(0.0, 70.0 - on_duty_last_8_days), 2)
+        available_tomorrow_70 = round(max(0.0, 70.0 - on_duty_last_7_days), 2)
+        available_tomorrow_60 = round(max(0.0, 60.0 - on_duty_last_8_days), 2)
 
         # Build remarks from stops on this day
         remarks = []
@@ -393,8 +399,12 @@ def build_daily_logs(
             "remarks": remarks,
             "recap": {
                 "on_duty_today": round(today_on_duty, 2),
+                "on_duty_last_5_days": on_duty_last_5_days,
+                "on_duty_last_7_days": on_duty_last_7_days,
                 "on_duty_last_8_days": on_duty_last_8_days,
                 "available_tomorrow": available_tomorrow,
+                "available_tomorrow_70": available_tomorrow_70,
+                "available_tomorrow_60": available_tomorrow_60,
                 "hours_warning": on_duty_last_8_days > 60.0,
                 "hours_critical": on_duty_last_8_days > 65.0,
             },

@@ -6,6 +6,7 @@ import math
 
 from django.db import transaction
 from rest_framework import viewsets, status
+from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, extend_schema_view
 
@@ -15,6 +16,12 @@ from .routing import geocode_location, get_route
 from .hos_engine import plan_trip
 
 logger = logging.getLogger(__name__)
+
+
+@api_view(["GET", "HEAD"])
+def health_check(_request):
+    """Lightweight uptime endpoint for hosting health checks."""
+    return Response({"status": "ok"})
 
 
 def error_payload(code: str, message: str, details=None) -> dict:
