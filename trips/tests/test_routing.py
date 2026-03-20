@@ -109,23 +109,16 @@ def test_get_route_uses_cache_for_repeat_queries(mock_mapbox_route, settings):
 
 
 @pytest.mark.django_db
-@patch("trips.routing.requests.post")
-def test_find_nearby_stop_poi_returns_nearest_real_facility(mock_post):
-    mock_post.return_value = _response(
+@patch("trips.routing.requests.get")
+def test_find_nearby_stop_poi_uses_mapbox_reverse_geocoding(mock_get, settings):
+    settings.MAPBOX_ACCESS_TOKEN = "mapbox-token"
+    mock_get.return_value = _response(
         {
-            "elements": [
+            "features": [
                 {
-                    "type": "node",
-                    "lat": 39.801,
-                    "lon": -86.145,
-                    "tags": {"name": "Pilot Travel Center", "amenity": "fuel"},
-                },
-                {
-                    "type": "node",
-                    "lat": 39.91,
-                    "lon": -86.20,
-                    "tags": {"name": "Far Fuel", "amenity": "fuel"},
-                },
+                    "geometry": {"coordinates": [-86.145, 39.801]},
+                    "properties": {"full_address": "Pilot Travel Center, Indianapolis, Indiana 46219"},
+                }
             ]
         }
     )
@@ -133,14 +126,15 @@ def test_find_nearby_stop_poi_returns_nearest_real_facility(mock_post):
     poi = find_nearby_stop_poi(39.8005, -86.1448, "FUEL")
 
     assert poi is not None
-    assert poi["name"] == "Pilot Travel Center"
-    assert poi["category"] == "Fuel station"
+    assert poi["name"] == "Pilot Travel Center, Indianapolis, Indiana 46219"
+    assert poi["category"] == "Mapbox fuel stop"
 
 
 @pytest.mark.django_db
-@patch("trips.routing.requests.post")
-def test_find_nearby_stop_poi_returns_none_when_lookup_fails(mock_post):
-    mock_post.side_effect = requests.RequestException("overpass down")
+@patch("trips.routing.requests.get")
+def test_find_nearby_stop_poi_returns_none_when_mapbox_lookup_fails(mock_get, settings):
+    settings.MAPBOX_ACCESS_TOKEN = "mapbox-token"
+    mock_get.side_effect = requests.RequestException("mapbox reverse down")
 
     poi = find_nearby_stop_poi(39.8, -86.14, "REST")
 
