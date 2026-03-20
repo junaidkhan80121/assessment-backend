@@ -56,6 +56,7 @@ def _compute_trip_payload(trip_id, data: dict) -> None:
         trip.dropoff_location_lon = dropoff_geo["lon"]
 
         routing_started_at = perf_counter()
+        include_alternatives = getattr(settings, "ROUTE_INCLUDE_ALTERNATIVES", False)
         with ThreadPoolExecutor(max_workers=2) as executor:
             leg1_route_future = executor.submit(
                 get_route,
@@ -71,7 +72,7 @@ def _compute_trip_payload(trip_id, data: dict) -> None:
                 pickup_geo["lat"],
                 dropoff_geo["lon"],
                 dropoff_geo["lat"],
-                True,
+                include_alternatives,
             )
 
             leg1_route = leg1_route_future.result()
@@ -174,7 +175,7 @@ def _compute_trip_payload(trip_id, data: dict) -> None:
             best_route["route_geometry"],
             best_route["total_distance_miles"],
             best_route["route_instructions"],
-            resolve_real_poi=True,
+            resolve_real_poi=getattr(settings, "RESOLVE_STOP_POIS_DURING_COMPUTE", False),
         )
 
         trip.route_options = route_options
@@ -237,6 +238,40 @@ def error_payload(code: str, message: str, details=None) -> dict:
     if details is not None:
         payload["details"] = details
     return payload
+
+
+def find_reusable_trip(data: dict) -> Trip | None:
+    """
+    Reuse a recent identical trip instead of recalculating the route plan.
+    This avoids duplicate routing/geocoding work for repeated submissions.
+    """
+    filters = {
+        "current_location": data["current_location"],
+        "pickup_location": data["pickup_location"],
+        "dropoff_location": data["dropoff_location"],
+        "current_cycle_used": data["current_cycle_used"],
+    }
+
+    for field in (
+        "current_location_lat",
+        "current_location_lon",
+        "pickup_location_lat",
+        "pickup_location_lon",
+        "dropoff_location_lat",
+        "dropoff_location_lon",
+    ):
+        value = data.get(field)
+        if value is not None:
+            filters[field] = value
+
+    return (
+        Trip.objects.filter(
+            status__in=[Trip.Status.COMPUTING, Trip.Status.COMPUTED],
+            **filters,
+        )
+        .order_by("-updated_at")
+        .first()
+    )
 
 
 def resolve_location(data: dict, field_name: str) -> dict:
@@ -482,6 +517,15 @@ class TripViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         data = serializer.validated_data
+        reusable_trip = find_reusable_trip(data)
+        if reusable_trip is not None:
+            output_serializer = TripDetailSerializer(reusable_trip)
+            response_status = (
+                status.HTTP_202_ACCEPTED
+                if reusable_trip.status == Trip.Status.COMPUTING
+                else status.HTTP_200_OK
+            )
+            return Response(output_serializer.data, status=response_status)
 
         # Create trip in COMPUTING state
         trip = Trip.objects.create(

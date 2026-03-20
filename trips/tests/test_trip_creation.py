@@ -6,7 +6,7 @@ from rest_framework.test import APIClient
 
 
 @pytest.mark.django_db
-@override_settings(TRIP_COMPUTE_ASYNC=False)
+@override_settings(TRIP_COMPUTE_ASYNC=False, ROUTE_INCLUDE_ALTERNATIVES=True)
 def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
     client = APIClient()
 
@@ -131,6 +131,58 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
 
 @pytest.mark.django_db
 @override_settings(TRIP_COMPUTE_ASYNC=False)
+def test_create_trip_defaults_to_single_route_option_for_faster_compute():
+    client = APIClient()
+
+    payload = {
+        "current_location": "Chicago, IL",
+        "current_location_lat": 41.8781,
+        "current_location_lon": -87.6298,
+        "pickup_location": "Indianapolis, IN",
+        "pickup_location_lat": 39.7684,
+        "pickup_location_lon": -86.1581,
+        "dropoff_location": "Nashville, TN",
+        "dropoff_location_lat": 36.1627,
+        "dropoff_location_lon": -86.7816,
+        "current_cycle_used": 12.0,
+    }
+
+    def route_stub(*args, **kwargs):
+        alternatives = bool(args[4]) if len(args) >= 5 else bool(kwargs.get("alternatives", False))
+        route = {
+            "distance_miles": 180.0,
+            "duration_hours": 3.2,
+            "geometry": [[41.8781, -87.6298], [39.7684, -86.1581]],
+            "instructions": [],
+        }
+        if alternatives:
+            raise AssertionError("Alternative routes should be disabled by default")
+        return route
+
+    def plan_trip_stub(**kwargs):
+        return {
+            "stops": [],
+            "daily_logs": [],
+            "total_on_duty_hours": 14.0,
+            "total_drive_hours": round(kwargs["leg1_duration_hours"] + kwargs["leg2_duration_hours"], 2),
+            "hos_compliant": True,
+            "weekly_hours_used": 26.0,
+            "weekly_hours_remaining": 44.0,
+        }
+
+    with patch("trips.views.geocode_location") as geocode_mock, patch(
+        "trips.views.get_route", side_effect=route_stub
+    ), patch("trips.views.plan_trip", side_effect=plan_trip_stub):
+        response = client.post("/api/trips/", payload, format="json")
+
+    assert response.status_code == 201
+    geocode_mock.assert_not_called()
+    data = response.json()
+    assert len(data["route_options"]) == 1
+
+
+@pytest.mark.django_db
+@override_settings(TRIP_COMPUTE_ASYNC=False)
 def test_create_trip_projects_generated_stop_markers_onto_route():
     client = APIClient()
 
@@ -212,9 +264,137 @@ def test_create_trip_projects_generated_stop_markers_onto_route():
     assert response.status_code == 201
     data = response.json()
     projected_stop = next(stop for stop in data["stops"] if stop["type"] == "BREAK")
+    assert projected_stop["lat"] != 0.0
+    assert projected_stop["lon"] != 0.0
+    assert projected_stop["location"].startswith("Approx.")
+
+
+@pytest.mark.django_db
+@override_settings(TRIP_COMPUTE_ASYNC=False, RESOLVE_STOP_POIS_DURING_COMPUTE=True)
+def test_create_trip_can_resolve_real_stop_pois_when_enabled():
+    client = APIClient()
+
+    payload = {
+        "current_location": "Chicago, IL",
+        "current_location_lat": 41.8781,
+        "current_location_lon": -87.6298,
+        "pickup_location": "Indianapolis, IN",
+        "pickup_location_lat": 39.7684,
+        "pickup_location_lon": -86.1581,
+        "dropoff_location": "Nashville, TN",
+        "dropoff_location_lat": 36.1627,
+        "dropoff_location_lon": -86.7816,
+        "current_cycle_used": 12.0,
+    }
+
+    def route_stub(*args, **kwargs):
+        alternatives = bool(args[4]) if len(args) >= 5 else bool(kwargs.get("alternatives", False))
+        route = {
+            "distance_miles": 200.0,
+            "duration_hours": 4.0,
+            "geometry": [
+                [41.8781, -87.6298],
+                [40.9, -87.1],
+                [39.7684, -86.1581],
+                [38.3, -86.5],
+                [36.1627, -86.7816],
+            ],
+            "instructions": [],
+        }
+        return [route] if alternatives else route
+
+    def plan_trip_stub(**_kwargs):
+        return {
+            "stops": [
+                {
+                    "type": "BREAK",
+                    "location": "En route (Leg 1)",
+                    "lat": 0.0,
+                    "lon": 0.0,
+                    "arrival_hour": 12.0,
+                    "duration_minutes": 30,
+                    "description": "30-min rest break",
+                    "progress_miles": 120.0,
+                },
+            ],
+            "daily_logs": [],
+            "total_on_duty_hours": 8.0,
+            "total_drive_hours": 7.0,
+            "hos_compliant": True,
+            "weekly_hours_used": 20.0,
+            "weekly_hours_remaining": 50.0,
+        }
+
+    with patch("trips.views.geocode_location"), patch(
+        "trips.views.get_route", side_effect=route_stub
+    ), patch("trips.views.plan_trip", side_effect=plan_trip_stub), patch(
+        "trips.views.find_nearby_stop_poi",
+        return_value={
+            "name": "Greenfield Rest Area",
+            "lat": 39.9,
+            "lon": -86.0,
+            "distance_miles": 2.4,
+            "category": "Rest area",
+        },
+    ):
+        response = client.post("/api/trips/", payload, format="json")
+
+    assert response.status_code == 201
+    data = response.json()
+    projected_stop = next(stop for stop in data["stops"] if stop["type"] == "BREAK")
     assert projected_stop["lat"] == 39.9
     assert projected_stop["lon"] == -86.0
     assert projected_stop["location"] == "Greenfield Rest Area"
+
+
+@pytest.mark.django_db
+@override_settings(TRIP_COMPUTE_ASYNC=False)
+def test_create_trip_reuses_identical_computed_trip_without_recomputing():
+    client = APIClient()
+
+    payload = {
+        "current_location": "Chicago, IL",
+        "current_location_lat": 41.8781,
+        "current_location_lon": -87.6298,
+        "pickup_location": "Indianapolis, IN",
+        "pickup_location_lat": 39.7684,
+        "pickup_location_lon": -86.1581,
+        "dropoff_location": "Nashville, TN",
+        "dropoff_location_lat": 36.1627,
+        "dropoff_location_lon": -86.7816,
+        "current_cycle_used": 12.0,
+    }
+
+    route = {
+        "distance_miles": 180.0,
+        "duration_hours": 3.2,
+        "geometry": [[41.8781, -87.6298], [39.7684, -86.1581]],
+        "instructions": [],
+    }
+
+    def plan_trip_stub(**kwargs):
+        return {
+            "stops": [],
+            "daily_logs": [],
+            "total_on_duty_hours": 14.0,
+            "total_drive_hours": round(kwargs["leg1_duration_hours"] + kwargs["leg2_duration_hours"], 2),
+            "hos_compliant": True,
+            "weekly_hours_used": 26.0,
+            "weekly_hours_remaining": 44.0,
+        }
+
+    with patch("trips.views.geocode_location") as geocode_mock, patch(
+        "trips.views.get_route", return_value=route
+    ) as route_mock, patch("trips.views.plan_trip", side_effect=plan_trip_stub) as plan_trip_mock:
+        first_response = client.post("/api/trips/", payload, format="json")
+        second_response = client.post("/api/trips/", payload, format="json")
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 200
+    geocode_mock.assert_not_called()
+    assert route_mock.call_count == 2
+    assert plan_trip_mock.call_count == 1
+    assert first_response.json()["id"] == second_response.json()["id"]
 
 
 @pytest.mark.django_db
