@@ -14,8 +14,9 @@ from drf_spectacular.utils import extend_schema, extend_schema_view
 
 from .models import Trip
 from .serializers import TripCreateSerializer, TripDetailSerializer
-from .routing import geocode_location, get_route
+from .routing import geocode_location, get_route, find_nearby_stop_poi
 from .hos_engine import plan_trip
+from .throttles import TripReadAnonThrottle, TripWriteAnonThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -107,12 +108,106 @@ def attach_stop_coordinates(stops: list[dict], route_geometry: list[list[float]]
             and total_distance_miles > 0
         ):
             progress_ratio = enriched.get("progress_miles", 0.0) / total_distance_miles
+            clamped_ratio = max(0.0, min(1.0, progress_ratio))
             interpolated = interpolate_route_position(route_geometry, progress_ratio)
             if interpolated is not None:
                 enriched["lat"], enriched["lon"] = interpolated
+            elif route_geometry:
+                # Fallback: sample along polyline so map markers still render
+                idx = int(round(clamped_ratio * (len(route_geometry) - 1)))
+                idx = max(0, min(len(route_geometry) - 1, idx))
+                pt = route_geometry[idx]
+                enriched["lat"], enriched["lon"] = pt[0], pt[1]
         enriched_stops.append(enriched)
 
     return enriched_stops
+
+
+def describe_progress_stop(stop: dict, total_distance_miles: float, route_instructions: list[dict]) -> dict:
+    enriched = dict(stop)
+    progress_miles = float(enriched.get("progress_miles", 0.0) or 0.0)
+    rounded_progress = int(round(progress_miles))
+
+    nearest_instruction = None
+    if route_instructions:
+        nearest_instruction = min(
+            route_instructions,
+            key=lambda instruction: abs(
+                float(instruction.get("cumulative_distance_miles", 0.0) or 0.0) - progress_miles
+            ),
+        )
+
+    road_name = ""
+    if nearest_instruction:
+        road_name = str(nearest_instruction.get("road_name") or "").strip()
+
+    if enriched.get("location", "").startswith("En route"):
+        if road_name:
+            enriched["location"] = f"Approx. near {road_name}"
+        elif total_distance_miles > 0:
+            enriched["location"] = f"Approx. mile {rounded_progress} of {int(round(total_distance_miles))}"
+
+    stop_type = enriched.get("type")
+    if stop_type == "FUEL":
+        enriched["description"] = (
+            f"{enriched.get('description', 'Fuel stop')} around mile {rounded_progress}"
+            + (f" near {road_name}" if road_name else "")
+        )
+    elif stop_type == "REST":
+        enriched["description"] = (
+            f"{enriched.get('description', 'Mandatory rest')} beginning around mile {rounded_progress}"
+            + (f" near {road_name}" if road_name else "")
+        )
+    elif stop_type == "BREAK":
+        enriched["description"] = (
+            f"{enriched.get('description', '30-min break')} taken around mile {rounded_progress}"
+            + (f" near {road_name}" if road_name else "")
+        )
+
+    return enriched
+
+
+def attach_real_stop_poi(stop: dict) -> dict:
+    enriched = dict(stop)
+    if enriched.get("type") not in {"FUEL", "REST", "BREAK"}:
+        return enriched
+
+    lat = float(enriched.get("lat", 0.0) or 0.0)
+    lon = float(enriched.get("lon", 0.0) or 0.0)
+    poi = find_nearby_stop_poi(lat, lon, enriched.get("type", ""))
+    if not poi:
+        return enriched
+
+    enriched["lat"] = poi["lat"]
+    enriched["lon"] = poi["lon"]
+    enriched["location"] = poi["name"]
+
+    distance_suffix = f" ({poi['distance_miles']} mi away)" if poi.get("distance_miles") is not None else ""
+    if enriched.get("type") == "FUEL":
+        enriched["description"] = f"Fuel stop at {poi['name']}{distance_suffix}"
+    elif enriched.get("type") == "REST":
+        enriched["description"] = f"Mandatory 10-hr rest near {poi['name']}{distance_suffix}"
+    elif enriched.get("type") == "BREAK":
+        enriched["description"] = f"30-min break near {poi['name']}{distance_suffix}"
+
+    return enriched
+
+
+def enrich_stop_metadata(
+    stops: list[dict],
+    route_geometry: list[list[float]],
+    total_distance_miles: float,
+    route_instructions: list[dict],
+    resolve_real_poi: bool = True,
+) -> list[dict]:
+    positioned_stops = attach_stop_coordinates(stops, route_geometry, total_distance_miles)
+    enriched_stops = [
+        describe_progress_stop(stop, total_distance_miles, route_instructions)
+        for stop in positioned_stops
+    ]
+    if not resolve_real_poi:
+        return enriched_stops
+    return [attach_real_stop_poi(stop) for stop in enriched_stops]
 
 
 @extend_schema_view(
@@ -152,6 +247,17 @@ class TripViewSet(viewsets.ModelViewSet):
         if self.action == "create":
             return TripCreateSerializer
         return TripDetailSerializer
+
+    def get_throttles(self):
+        # Throttling is temporarily disabled for development/demo use.
+        # if self.action == "create":
+        #     throttle_classes = [TripWriteAnonThrottle]
+        # elif self.action in {"list", "retrieve"}:
+        #     throttle_classes = [TripReadAnonThrottle]
+        # else:
+        #     throttle_classes = []
+        # return [throttle() for throttle in throttle_classes]
+        return []
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -220,6 +326,10 @@ class TripViewSet(viewsets.ModelViewSet):
 
                 leg1_route = leg1_route_future.result()
                 leg2_variants = leg2_variants_future.result()
+            # get_route(..., alternatives=True) returns a list; ensure we never
+            # iterate a single dict (would step over string keys).
+            if isinstance(leg2_variants, dict):
+                leg2_variants = [leg2_variants]
             logger.info(
                 "Trip %s routing completed in %.2fs with %s variant(s)",
                 trip.id,
@@ -228,6 +338,7 @@ class TripViewSet(viewsets.ModelViewSet):
             )
             
             route_options = []
+            variant_errors: list[str] = []
             
             # Process each variant into a complete trip option
             for i, leg2_route in enumerate(leg2_variants):
@@ -268,10 +379,12 @@ class TripViewSet(viewsets.ModelViewSet):
                         i,
                         perf_counter() - hos_started_at,
                     )
-                    enriched_stops = attach_stop_coordinates(
+                    enriched_stops = enrich_stop_metadata(
                         hos_result["stops"],
                         geometry,
                         total_distance,
+                        instructions,
+                        resolve_real_poi=False,
                     )
                     
                     route_options.append({
@@ -292,9 +405,12 @@ class TripViewSet(viewsets.ModelViewSet):
                         "weekly_hours_remaining": hos_result["weekly_hours_remaining"],
                     })
                 except ValueError as e:
+                    variant_errors.append(str(e))
                     logger.warning("Variant %s violated constraints immediately: %s", i, e)
 
             if not route_options:
+                if variant_errors:
+                    raise ValueError(variant_errors[0])
                 raise ValueError("No viable routes could be planned within limits.")
 
             # Step 5: Rank and annotate route options.
@@ -311,6 +427,14 @@ class TripViewSet(viewsets.ModelViewSet):
             # Use the fastest route as the primary trip geometry.
             best_route = route_options[fastest_index]
             
+            best_route["stops"] = enrich_stop_metadata(
+                best_route["stops"],
+                best_route["route_geometry"],
+                best_route["total_distance_miles"],
+                best_route["route_instructions"],
+                resolve_real_poi=True,
+            )
+
             trip.route_options = route_options
             trip.route_instructions = best_route["route_instructions"]
             trip.leg1_miles = best_route["leg1_miles"]

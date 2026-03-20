@@ -21,7 +21,9 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
         "current_cycle_used": 12.0,
     }
 
-    def route_stub(*_args, alternatives=False, **_kwargs):
+    def route_stub(*args, **kwargs):
+        # views calls get_route(lon1, lat1, lon2, lat2, alternatives) positionally
+        alternatives = bool(args[4]) if len(args) >= 5 else bool(kwargs.get("alternatives", False))
         if alternatives:
             return [
                 {
@@ -142,7 +144,8 @@ def test_create_trip_projects_generated_stop_markers_onto_route():
         "current_cycle_used": 12.0,
     }
 
-    def route_stub(*_args, alternatives=False, **_kwargs):
+    def route_stub(*args, **kwargs):
+        alternatives = bool(args[4]) if len(args) >= 5 else bool(kwargs.get("alternatives", False))
         route = {
             "distance_miles": 200.0,
             "duration_hours": 4.0,
@@ -191,11 +194,61 @@ def test_create_trip_projects_generated_stop_markers_onto_route():
 
     with patch("trips.views.geocode_location"), patch(
         "trips.views.get_route", side_effect=route_stub
-    ), patch("trips.views.plan_trip", side_effect=plan_trip_stub):
+    ), patch("trips.views.plan_trip", side_effect=plan_trip_stub), patch(
+        "trips.views.find_nearby_stop_poi",
+        return_value={
+            "name": "Greenfield Rest Area",
+            "lat": 39.9,
+            "lon": -86.0,
+            "distance_miles": 2.4,
+            "category": "Rest area",
+        },
+    ):
         response = client.post("/api/trips/", payload, format="json")
 
     assert response.status_code == 201
     data = response.json()
     projected_stop = next(stop for stop in data["stops"] if stop["type"] == "BREAK")
-    assert projected_stop["lat"] != 0.0
-    assert projected_stop["lon"] != 0.0
+    assert projected_stop["lat"] == 39.9
+    assert projected_stop["lon"] == -86.0
+    assert projected_stop["location"] == "Greenfield Rest Area"
+
+
+@pytest.mark.django_db
+def test_create_trip_surfaces_variant_failure_reason():
+    client = APIClient()
+
+    payload = {
+        "current_location": "Chicago, IL",
+        "current_location_lat": 41.8781,
+        "current_location_lon": -87.6298,
+        "pickup_location": "Indianapolis, IN",
+        "pickup_location_lat": 39.7684,
+        "pickup_location_lon": -86.1581,
+        "dropoff_location": "Nashville, TN",
+        "dropoff_location_lat": 36.1627,
+        "dropoff_location_lon": -86.7816,
+        "current_cycle_used": 68.5,
+    }
+
+    def route_stub(*args, **kwargs):
+        alternatives = bool(args[4]) if len(args) >= 5 else bool(kwargs.get("alternatives", False))
+        route = {
+            "distance_miles": 200.0,
+            "duration_hours": 4.0,
+            "geometry": [
+                [41.8781, -87.6298],
+                [39.7684, -86.1581],
+                [36.1627, -86.7816],
+            ],
+            "instructions": [],
+        }
+        return [route] if alternatives else route
+
+    with patch("trips.views.geocode_location"), patch(
+        "trips.views.get_route", side_effect=route_stub
+    ):
+        response = client.post("/api/trips/", payload, format="json")
+
+    assert response.status_code == 422
+    assert "70-hour" in response.json()["message"]

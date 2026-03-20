@@ -62,6 +62,8 @@ def _decode_polyline(encoded: str) -> list[list[float]]:
     return coords
 
 ORS_BASE_URL = "https://api.openrouteservice.org"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+POI_FAILURE_CACHE_KEY = "trips:poi:lookup-suspended"
 
 
 def geocode_location(query: str) -> dict:
@@ -200,6 +202,122 @@ def get_route(
     result = _fallback_route(start_lat, start_lon, end_lat, end_lon, alternatives)
     cache.set(cache_key, result, timeout=getattr(settings, "ROUTE_CACHE_TIMEOUT", 21600))
     return result
+
+
+def find_nearby_stop_poi(lat: float, lon: float, stop_type: str) -> dict | None:
+    """
+    Find a nearby real-world POI for generated stop markers using OpenStreetMap
+    data through Overpass. Returns None when no suitable facility is found.
+    """
+    if abs(lat) < 0.0001 and abs(lon) < 0.0001:
+        return None
+
+    if cache.get(POI_FAILURE_CACHE_KEY):
+        return None
+
+    normalized_type = (stop_type or "").upper()
+    cache_key = _cache_key("poi", round(lat, 4), round(lon, 4), normalized_type)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    tag_queries = {
+        "FUEL": [
+            'node["amenity"="fuel"]',
+            'way["amenity"="fuel"]',
+        ],
+        "REST": [
+            'node["highway"="rest_area"]',
+            'way["highway"="rest_area"]',
+            'node["highway"="services"]',
+            'way["highway"="services"]',
+            'node["amenity"="truck_stop"]',
+            'way["amenity"="truck_stop"]',
+        ],
+        "BREAK": [
+            'node["highway"="rest_area"]',
+            'way["highway"="rest_area"]',
+            'node["highway"="services"]',
+            'way["highway"="services"]',
+            'node["amenity"="parking"]',
+            'way["amenity"="parking"]',
+            'node["amenity"="truck_stop"]',
+            'way["amenity"="truck_stop"]',
+        ],
+    }
+    queries = tag_queries.get(normalized_type, [])
+    if not queries:
+        cache.set(cache_key, None, timeout=getattr(settings, "GEOCODE_CACHE_TIMEOUT", 86400))
+        return None
+
+    search_radius_meters = int(getattr(settings, "POI_LOOKUP_RADIUS_METERS", 12000))
+    query_body = "".join(f"{query}(around:{search_radius_meters},{lat},{lon});" for query in queries)
+    overpass_query = f"""
+        [out:json][timeout:12];
+        (
+          {query_body}
+        );
+        out center tags 12;
+    """
+
+    try:
+        resp = requests.post(
+            OVERPASS_URL,
+            data=overpass_query,
+            headers={
+                "User-Agent": "eld-trip-planner/1.0",
+                "Accept": "application/json",
+            },
+            timeout=getattr(settings, "POI_LOOKUP_TIMEOUT_SECONDS", 4),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        logger.warning("POI lookup failed for %s at %.4f,%.4f: %s", normalized_type, lat, lon, e)
+        response = getattr(e, "response", None)
+        status_code = response.status_code if response is not None else None
+        if status_code in {429, 500, 502, 503, 504}:
+            cache.set(
+                POI_FAILURE_CACHE_KEY,
+                True,
+                timeout=int(getattr(settings, "POI_LOOKUP_FAILURE_COOLDOWN_SECONDS", 900)),
+            )
+        cache.set(cache_key, None, timeout=1800)
+        return None
+
+    best_match = None
+    best_distance = None
+
+    for element in data.get("elements", []):
+        tags = element.get("tags", {}) or {}
+        poi_lat = element.get("lat")
+        poi_lon = element.get("lon")
+        if poi_lat is None or poi_lon is None:
+            center = element.get("center", {}) or {}
+            poi_lat = center.get("lat")
+            poi_lon = center.get("lon")
+        if poi_lat is None or poi_lon is None:
+            continue
+
+        distance = _haversine_miles(lat, lon, float(poi_lat), float(poi_lon))
+        if best_distance is not None and distance >= best_distance:
+            continue
+
+        name = tags.get("name") or _poi_type_label(tags)
+        if not name:
+            continue
+
+        best_match = {
+            "name": name,
+            "lat": float(poi_lat),
+            "lon": float(poi_lon),
+            "distance_miles": round(distance, 1),
+            "category": _poi_type_label(tags),
+        }
+        best_distance = distance
+
+    cache.set(cache_key, best_match, timeout=getattr(settings, "GEOCODE_CACHE_TIMEOUT", 86400))
+    return best_match
 
 
 def _get_mapbox_route(
@@ -412,6 +530,29 @@ def _fallback_geocode(query: str) -> dict | None:
             return {"lat": coords["lat"], "lon": coords["lon"], "label": query}
 
     return None
+
+
+def _poi_type_label(tags: dict) -> str:
+    if tags.get("amenity") == "fuel":
+        return "Fuel station"
+    if tags.get("amenity") == "truck_stop":
+        return "Truck stop"
+    if tags.get("highway") == "rest_area":
+        return "Rest area"
+    if tags.get("highway") == "services":
+        return "Highway services"
+    if tags.get("amenity") == "parking":
+        return "Parking area"
+    return "Roadside facility"
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
+    lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+    return 3958.8 * (2 * math.asin(math.sqrt(a)))
 
 
 def _fallback_route(

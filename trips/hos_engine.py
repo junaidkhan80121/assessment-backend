@@ -77,12 +77,12 @@ def plan_trip(
     """
 
     # ── PRE-FLIGHT CHECK ────────────────────────────────────────────────────
-    # if current_cycle_used >= 70.0:
-    #     raise ValueError(
-    #         f"You have used all 70 hours in your current 8-day cycle "
-    #         f"({current_cycle_used} hrs). You must take a 34-hour restart "
-    #         f"before driving again."
-    #     )
+    if current_cycle_used >= 70.0:
+        raise ValueError(
+            f"You have used all 70 hours in your current 8-day cycle "
+            f"({current_cycle_used} hrs). You must take a 34-hour restart "
+            f"before driving again."
+        )
 
     hours_remaining_at_start = 70.0 - current_cycle_used
 
@@ -91,17 +91,16 @@ def plan_trip(
 
     # ── HELPER: CHECK 70-HR AFTER EVERY ON-DUTY EVENT ───────────────────────
     def check_70hr_limit(about_to_add: float = 0.0) -> None:
-        pass # Bypassed for testing
-        # projected = state.weekly_hours + about_to_add
-        # if projected > 70.0:
-        #     overage = projected - 70.0
-        #     raise ValueError(
-        #         f"Trip exceeds the 70-hour/8-day limit by {overage:.1f} hours. "
-        #         f"Current cycle used: {current_cycle_used:.1f} hrs. "
-        #         f"Hours available for this trip: {hours_remaining_at_start:.1f} hrs. "
-        #         f"Reduce trip distance, lower current cycle hours, or plan a "
-        #         f"34-hour restart before departing."
-        #     )
+        projected = state.weekly_hours + about_to_add
+        if projected > 70.0:
+            overage = projected - 70.0
+            raise ValueError(
+                f"Trip exceeds the 70-hour/8-day limit by {overage:.1f} hours. "
+                f"Current cycle used: {current_cycle_used:.1f} hrs. "
+                f"Hours available for this trip: {hours_remaining_at_start:.1f} hrs. "
+                f"Reduce trip distance, lower current cycle hours, or plan a "
+                f"34-hour restart before departing."
+            )
 
     # ── HELPERS ──────────────────────────────────────────────────────────────
     def add_off_duty(hours: float, location: str) -> None:
@@ -154,21 +153,22 @@ def plan_trip(
                 max(until_11hr, 0.0),
                 max(until_14hr, 0.0),
                 max(until_break, 0.0),
-                # max(until_70hr, 0.0), # Bypassed for testing
+                max(until_70hr, 0.0),
             )
 
             if max_drive <= 0.001:
-                # if until_70hr <= 0.001:
-                #     raise ValueError(
-                #         f"Trip cannot be completed within the 70-hour/8-day limit. "
-                #         f"Cycle already used: {current_cycle_used:.1f} hrs. "
-                #         f"On-duty hours scheduled in this trip so far: "
-                #         f"{state.weekly_hours - current_cycle_used:.1f} hrs. "
-                #         f"Total: {state.weekly_hours:.1f} / 70.0 hrs. "
-                #         f"Please take a 34-hour restart before beginning this trip, "
-                #         f"or reduce your current cycle used input."
-                #     )
+                if until_70hr <= 0.001:
+                    raise ValueError(
+                        f"Trip cannot be completed within the 70-hour/8-day limit. "
+                        f"Cycle already used: {current_cycle_used:.1f} hrs. "
+                        f"On-duty hours scheduled in this trip so far: "
+                        f"{state.weekly_hours - current_cycle_used:.1f} hrs. "
+                        f"Total: {state.weekly_hours:.1f} / 70.0 hrs. "
+                        f"Please take a 34-hour restart before beginning this trip, "
+                        f"or reduce your current cycle used input."
+                    )
                 # Hit 11-hr or 14-hr window — mandatory 10-hr rest
+                # duration_minutes=600 encodes 10 hr; UI should format as hours for readability
                 state.stops.append(Stop(
                     "REST", location, 0, 0, state.current_hour, 600,
                     "10-hr mandatory off-duty rest", state.trip_miles_completed
@@ -371,8 +371,10 @@ def build_daily_logs(
         on_duty_last_7_days = round(sum(on_duty_history[-7:]), 2)
         on_duty_last_8_days = round(current_cycle_used + trip_on_duty_so_far, 2)
         available_tomorrow = round(max(0.0, 70.0 - on_duty_last_8_days), 2)
-        available_tomorrow_70 = round(max(0.0, 70.0 - on_duty_last_7_days), 2)
-        available_tomorrow_60 = round(max(0.0, 60.0 - on_duty_last_8_days), 2)
+        # The recap block on the rendered paper log includes both 70/8 and 60/7
+        # formulas, even though this project assumes a 70/8 property carrier.
+        available_tomorrow_70 = round(max(0.0, 70.0 - on_duty_last_8_days), 2)
+        available_tomorrow_60 = round(max(0.0, 60.0 - on_duty_last_7_days), 2)
 
         # Build remarks from stops on this day
         remarks = []

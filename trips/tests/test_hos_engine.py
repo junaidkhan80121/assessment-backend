@@ -14,7 +14,6 @@ class TestHOSEngine:
         If current_cycle_used=65 and the trip needs >5 hrs on-duty,
         total>70 → must raise ValueError.
         """
-        pytest.xfail("70-hour/8-day enforcement is intentionally disabled for this assessment build.")
         with pytest.raises(ValueError, match="70-hour"):
             plan_trip(
                 total_distance_miles=500,
@@ -36,7 +35,6 @@ class TestHOSEngine:
         current_cycle_used=68, even a short trip needs pickup+dropoff+inspection=2.5 hrs min.
         68+2.5 = 70.5 → raises.
         """
-        pytest.xfail("70-hour/8-day enforcement is intentionally disabled for this assessment build.")
         with pytest.raises(ValueError):
             plan_trip(
                 total_distance_miles=100,
@@ -101,12 +99,32 @@ class TestHOSEngine:
                 f"Day {log['day_number']}: recap B={log['recap']['on_duty_last_8_days']} " \
                 f"expected {running:.2f}"
 
+    def test_recap_availability_matches_70hr_and_60hr_formulas(self):
+        result = plan_trip(
+            total_distance_miles=1200,
+            leg1_miles=600,
+            leg2_miles=600,
+            leg1_duration_hours=11.0,
+            leg2_duration_hours=11.0,
+            current_cycle_used=20.0,
+            pickup_location="Denver, CO",
+            dropoff_location="Salt Lake City, UT",
+            pickup_lat=39.74,
+            pickup_lon=-104.99,
+            dropoff_lat=40.76,
+            dropoff_lon=-111.89,
+        )
+        first_day = result["daily_logs"][0]["recap"]
+        assert first_day["on_duty_last_8_days"] == 33.0
+        assert first_day["available_tomorrow_70"] == 37.0
+        assert first_day["on_duty_last_7_days"] == 13.0
+        assert first_day["available_tomorrow_60"] == 47.0
+
     def test_not_driving_hours_count_toward_70hr(self):
         """
         Pickup + dropoff (each 1 hr on-duty not-driving) must add to weekly_hours.
         With current_cycle_used=68.5 and pickup+dropoff+inspection=2.5 hrs → raises.
         """
-        pytest.xfail("70-hour/8-day enforcement is intentionally disabled for this assessment build.")
         with pytest.raises(ValueError):
             plan_trip(
                 total_distance_miles=10,
@@ -125,7 +143,6 @@ class TestHOSEngine:
 
     def test_preflight_check_at_70(self):
         """current_cycle_used=70 → raises immediately."""
-        pytest.xfail("70-hour/8-day enforcement is intentionally disabled for this assessment build.")
         with pytest.raises(ValueError, match="all 70 hours"):
             plan_trip(
                 total_distance_miles=10,

@@ -116,12 +116,14 @@ REST_FRAMEWORK = {
         "rest_framework.renderers.JSONRenderer",
         "rest_framework.renderers.BrowsableAPIRenderer",
     ],
-    "DEFAULT_THROTTLE_CLASSES": [
-        "rest_framework.throttling.AnonRateThrottle",
-    ],
-    "DEFAULT_THROTTLE_RATES": {
-        "anon": "30/minute",
-    },
+    # Throttling is temporarily disabled for development/demo use.
+    # To re-enable it, restore the scoped throttle rates below and the
+    # per-view throttle wiring in trips/views.py.
+    "DEFAULT_THROTTLE_CLASSES": [],
+    # "DEFAULT_THROTTLE_RATES": {
+    #     "trip_read": "240/minute",
+    #     "trip_write": "60/minute",
+    # },
 }
 
 # ── Caching ───────────────────────────────────────────────────────────────
@@ -177,3 +179,6 @@ MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN", "")
 
 GEOCODE_CACHE_TIMEOUT = int(os.getenv("GEOCODE_CACHE_TIMEOUT", "86400"))
 ROUTE_CACHE_TIMEOUT = int(os.getenv("ROUTE_CACHE_TIMEOUT", "21600"))
+POI_LOOKUP_TIMEOUT_SECONDS = int(os.getenv("POI_LOOKUP_TIMEOUT_SECONDS", "4"))
+POI_LOOKUP_RADIUS_METERS = int(os.getenv("POI_LOOKUP_RADIUS_METERS", "12000"))
+POI_LOOKUP_FAILURE_COOLDOWN_SECONDS = int(os.getenv("POI_LOOKUP_FAILURE_COOLDOWN_SECONDS", "900"))
