@@ -4,21 +4,222 @@ Trip API views.
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
+import threading
 from time import perf_counter
 
+from django.conf import settings
 from django.db import transaction
+from django.db import close_old_connections
 from rest_framework import viewsets, status
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, extend_schema_view
 
 from .models import Trip
-from .serializers import TripCreateSerializer, TripDetailSerializer
+from .serializers import TripCreateSerializer, TripDetailSerializer, TripListSerializer
 from .routing import geocode_location, get_route, find_nearby_stop_poi
 from .hos_engine import plan_trip
 from .throttles import TripReadAnonThrottle, TripWriteAnonThrottle
 
 logger = logging.getLogger(__name__)
+
+
+class TripHistoryPagination(PageNumberPagination):
+    page_size = 5
+    page_size_query_param = "page_size"
+    max_page_size = 50
+
+
+def _compute_trip_payload(trip_id, data: dict) -> None:
+    close_old_connections()
+    try:
+        trip = Trip.objects.get(pk=trip_id)
+        request_started_at = perf_counter()
+
+        geocode_started_at = perf_counter()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            current_geo_future = executor.submit(resolve_location, data, "current_location")
+            pickup_geo_future = executor.submit(resolve_location, data, "pickup_location")
+            dropoff_geo_future = executor.submit(resolve_location, data, "dropoff_location")
+
+            current_geo = current_geo_future.result()
+            pickup_geo = pickup_geo_future.result()
+            dropoff_geo = dropoff_geo_future.result()
+        logger.info("Trip %s geocoding completed in %.2fs", trip.id, perf_counter() - geocode_started_at)
+
+        trip.current_location_lat = current_geo["lat"]
+        trip.current_location_lon = current_geo["lon"]
+        trip.pickup_location_lat = pickup_geo["lat"]
+        trip.pickup_location_lon = pickup_geo["lon"]
+        trip.dropoff_location_lat = dropoff_geo["lat"]
+        trip.dropoff_location_lon = dropoff_geo["lon"]
+
+        routing_started_at = perf_counter()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leg1_route_future = executor.submit(
+                get_route,
+                current_geo["lon"],
+                current_geo["lat"],
+                pickup_geo["lon"],
+                pickup_geo["lat"],
+                False,
+            )
+            leg2_variants_future = executor.submit(
+                get_route,
+                pickup_geo["lon"],
+                pickup_geo["lat"],
+                dropoff_geo["lon"],
+                dropoff_geo["lat"],
+                True,
+            )
+
+            leg1_route = leg1_route_future.result()
+            leg2_variants = leg2_variants_future.result()
+        if isinstance(leg2_variants, dict):
+            leg2_variants = [leg2_variants]
+        logger.info(
+            "Trip %s routing completed in %.2fs with %s variant(s)",
+            trip.id,
+            perf_counter() - routing_started_at,
+            len(leg2_variants),
+        )
+
+        route_options = []
+        variant_errors: list[str] = []
+
+        for i, leg2_route in enumerate(leg2_variants):
+            leg1_miles = leg1_route["distance_miles"]
+            leg2_miles = leg2_route["distance_miles"]
+            leg1_duration = leg1_route["duration_hours"]
+            leg2_duration = leg2_route["duration_hours"]
+            total_distance = leg1_miles + leg2_miles
+            geometry = leg1_route["geometry"] + leg2_route["geometry"]
+            instructions = [
+                *leg1_route.get("instructions", []),
+                *leg2_route.get("instructions", []),
+            ]
+
+            try:
+                hos_started_at = perf_counter()
+                hos_result = plan_trip(
+                    total_distance_miles=total_distance,
+                    leg1_miles=leg1_miles,
+                    leg2_miles=leg2_miles,
+                    leg1_duration_hours=leg1_duration,
+                    leg2_duration_hours=leg2_duration,
+                    current_cycle_used=data["current_cycle_used"],
+                    pickup_location=data["pickup_location"],
+                    dropoff_location=data["dropoff_location"],
+                    pickup_lat=pickup_geo["lat"],
+                    pickup_lon=pickup_geo["lon"],
+                    dropoff_lat=dropoff_geo["lat"],
+                    dropoff_lon=dropoff_geo["lon"],
+                    current_location=data["current_location"],
+                    current_lat=current_geo["lat"],
+                    current_lon=current_geo["lon"],
+                )
+                logger.info(
+                    "Trip %s HOS planning for variant %s completed in %.2fs",
+                    trip.id,
+                    i,
+                    perf_counter() - hos_started_at,
+                )
+                enriched_stops = enrich_stop_metadata(
+                    hos_result["stops"],
+                    geometry,
+                    total_distance,
+                    instructions,
+                    resolve_real_poi=False,
+                )
+
+                route_options.append({
+                    "id": i,
+                    "leg1_miles": leg1_miles,
+                    "leg2_miles": leg2_miles,
+                    "total_distance_miles": total_distance,
+                    "leg1_duration_hours": leg1_duration,
+                    "leg2_duration_hours": leg2_duration,
+                    "route_geometry": geometry,
+                    "route_instructions": instructions,
+                    "stops": enriched_stops,
+                    "daily_logs": hos_result["daily_logs"],
+                    "total_on_duty_hours": hos_result["total_on_duty_hours"],
+                    "total_drive_hours": hos_result["total_drive_hours"],
+                    "hos_compliant": hos_result["hos_compliant"],
+                    "weekly_hours_used": hos_result["weekly_hours_used"],
+                    "weekly_hours_remaining": hos_result["weekly_hours_remaining"],
+                })
+            except ValueError as e:
+                variant_errors.append(str(e))
+                logger.warning("Variant %s violated constraints immediately: %s", i, e)
+
+        if not route_options:
+            if variant_errors:
+                raise ValueError(variant_errors[0])
+            raise ValueError("No viable routes could be planned within limits.")
+
+        route_options.sort(key=lambda opt: opt["total_distance_miles"])
+        fastest_index = min(
+            range(len(route_options)),
+            key=lambda idx: route_options[idx]["total_drive_hours"],
+        )
+        for idx, option in enumerate(route_options):
+            option["is_fastest"] = idx == fastest_index
+            option["label"] = "Fastest route" if option["is_fastest"] else "Alternative route"
+
+        best_route = route_options[fastest_index]
+        best_route["stops"] = enrich_stop_metadata(
+            best_route["stops"],
+            best_route["route_geometry"],
+            best_route["total_distance_miles"],
+            best_route["route_instructions"],
+            resolve_real_poi=True,
+        )
+
+        trip.route_options = route_options
+        trip.route_instructions = best_route["route_instructions"]
+        trip.leg1_miles = best_route["leg1_miles"]
+        trip.leg2_miles = best_route["leg2_miles"]
+        trip.leg1_duration_hours = best_route["leg1_duration_hours"]
+        trip.leg2_duration_hours = best_route["leg2_duration_hours"]
+        trip.total_distance_miles = best_route["total_distance_miles"]
+        trip.route_geometry = best_route["route_geometry"]
+        trip.stops = best_route["stops"]
+        trip.daily_logs = best_route["daily_logs"]
+        trip.total_on_duty_hours = best_route["total_on_duty_hours"]
+        trip.total_drive_hours = best_route["total_drive_hours"]
+        trip.hos_compliant = best_route["hos_compliant"]
+        trip.weekly_hours_used = best_route["weekly_hours_used"]
+        trip.weekly_hours_remaining = best_route["weekly_hours_remaining"]
+
+        trip.status = Trip.Status.COMPUTED
+        trip.save()
+        logger.info("Trip %s fully computed in %.2fs", trip.id, perf_counter() - request_started_at)
+
+    except ValueError as e:
+        Trip.objects.filter(pk=trip_id).update(
+            status=Trip.Status.FAILED,
+            error_message=str(e),
+        )
+    except Exception as e:
+        logger.exception("Unexpected error computing trip %s", trip_id)
+        Trip.objects.filter(pk=trip_id).update(
+            status=Trip.Status.FAILED,
+            error_message=f"Internal error: {str(e)}",
+        )
+    finally:
+        close_old_connections()
+
+
+def start_trip_compute_job(trip_id, data: dict) -> None:
+    thread = threading.Thread(
+        target=_compute_trip_payload,
+        args=(trip_id, data),
+        daemon=True,
+        name=f"trip-compute-{trip_id}",
+    )
+    thread.start()
 
 
 @api_view(["GET", "HEAD"])
@@ -242,10 +443,19 @@ class TripViewSet(viewsets.ModelViewSet):
     """
     queryset = Trip.objects.all()
     http_method_names = ["get", "post", "head", "options"]
+    pagination_class = TripHistoryPagination
+
+    def get_queryset(self):
+        queryset = Trip.objects.all()
+        if self.action == "list":
+            return queryset.defer("route_geometry", "route_options", "route_instructions")
+        return queryset
 
     def get_serializer_class(self):
         if self.action == "create":
             return TripCreateSerializer
+        if self.action == "list":
+            return TripListSerializer
         return TripDetailSerializer
 
     def get_throttles(self):
@@ -282,201 +492,30 @@ class TripViewSet(viewsets.ModelViewSet):
             status=Trip.Status.COMPUTING,
         )
 
-        try:
-            request_started_at = perf_counter()
-
-            # Step 1: Geocode locations
-            geocode_started_at = perf_counter()
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                current_geo_future = executor.submit(resolve_location, data, "current_location")
-                pickup_geo_future = executor.submit(resolve_location, data, "pickup_location")
-                dropoff_geo_future = executor.submit(resolve_location, data, "dropoff_location")
-
-                current_geo = current_geo_future.result()
-                pickup_geo = pickup_geo_future.result()
-                dropoff_geo = dropoff_geo_future.result()
-            logger.info("Trip %s geocoding completed in %.2fs", trip.id, perf_counter() - geocode_started_at)
-
-            trip.current_location_lat = current_geo["lat"]
-            trip.current_location_lon = current_geo["lon"]
-            trip.pickup_location_lat = pickup_geo["lat"]
-            trip.pickup_location_lon = pickup_geo["lon"]
-            trip.dropoff_location_lat = dropoff_geo["lat"]
-            trip.dropoff_location_lon = dropoff_geo["lon"]
-
-            # Step 2: Fetch both route legs concurrently to reduce end-to-end latency.
-            routing_started_at = perf_counter()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                leg1_route_future = executor.submit(
-                    get_route,
-                    current_geo["lon"],
-                    current_geo["lat"],
-                    pickup_geo["lon"],
-                    pickup_geo["lat"],
-                    False,
-                )
-                leg2_variants_future = executor.submit(
-                    get_route,
-                    pickup_geo["lon"],
-                    pickup_geo["lat"],
-                    dropoff_geo["lon"],
-                    dropoff_geo["lat"],
-                    True,
-                )
-
-                leg1_route = leg1_route_future.result()
-                leg2_variants = leg2_variants_future.result()
-            # get_route(..., alternatives=True) returns a list; ensure we never
-            # iterate a single dict (would step over string keys).
-            if isinstance(leg2_variants, dict):
-                leg2_variants = [leg2_variants]
-            logger.info(
-                "Trip %s routing completed in %.2fs with %s variant(s)",
-                trip.id,
-                perf_counter() - routing_started_at,
-                len(leg2_variants),
-            )
-            
-            route_options = []
-            variant_errors: list[str] = []
-            
-            # Process each variant into a complete trip option
-            for i, leg2_route in enumerate(leg2_variants):
-                leg1_miles = leg1_route["distance_miles"]
-                leg2_miles = leg2_route["distance_miles"]
-                leg1_duration = leg1_route["duration_hours"]
-                leg2_duration = leg2_route["duration_hours"]
-                total_distance = leg1_miles + leg2_miles
-                geometry = leg1_route["geometry"] + leg2_route["geometry"]
-                instructions = [
-                    *leg1_route.get("instructions", []),
-                    *leg2_route.get("instructions", []),
-                ]
-                
-                # Step 4: Run HOS engine for this specific variant
-                try:
-                    hos_started_at = perf_counter()
-                    hos_result = plan_trip(
-                        total_distance_miles=total_distance,
-                        leg1_miles=leg1_miles,
-                        leg2_miles=leg2_miles,
-                        leg1_duration_hours=leg1_duration,
-                        leg2_duration_hours=leg2_duration,
-                        current_cycle_used=data["current_cycle_used"],
-                        pickup_location=data["pickup_location"],
-                        dropoff_location=data["dropoff_location"],
-                        pickup_lat=pickup_geo["lat"],
-                        pickup_lon=pickup_geo["lon"],
-                        dropoff_lat=dropoff_geo["lat"],
-                        dropoff_lon=dropoff_geo["lon"],
-                        current_location=data["current_location"],
-                        current_lat=current_geo["lat"],
-                        current_lon=current_geo["lon"],
-                    )
-                    logger.info(
-                        "Trip %s HOS planning for variant %s completed in %.2fs",
-                        trip.id,
-                        i,
-                        perf_counter() - hos_started_at,
-                    )
-                    enriched_stops = enrich_stop_metadata(
-                        hos_result["stops"],
-                        geometry,
-                        total_distance,
-                        instructions,
-                        resolve_real_poi=False,
-                    )
-                    
-                    route_options.append({
-                        "id": i,
-                        "leg1_miles": leg1_miles,
-                        "leg2_miles": leg2_miles,
-                        "total_distance_miles": total_distance,
-                        "leg1_duration_hours": leg1_duration,
-                        "leg2_duration_hours": leg2_duration,
-                        "route_geometry": geometry,
-                        "route_instructions": instructions,
-                        "stops": enriched_stops,
-                        "daily_logs": hos_result["daily_logs"],
-                        "total_on_duty_hours": hos_result["total_on_duty_hours"],
-                        "total_drive_hours": hos_result["total_drive_hours"],
-                        "hos_compliant": hos_result["hos_compliant"],
-                        "weekly_hours_used": hos_result["weekly_hours_used"],
-                        "weekly_hours_remaining": hos_result["weekly_hours_remaining"],
-                    })
-                except ValueError as e:
-                    variant_errors.append(str(e))
-                    logger.warning("Variant %s violated constraints immediately: %s", i, e)
-
-            if not route_options:
-                if variant_errors:
-                    raise ValueError(variant_errors[0])
-                raise ValueError("No viable routes could be planned within limits.")
-
-            # Step 5: Rank and annotate route options.
-            # Fastest route is the one with the smallest total drive duration.
-            route_options.sort(key=lambda opt: opt["total_distance_miles"])
-            fastest_index = min(
-                range(len(route_options)),
-                key=lambda idx: route_options[idx]["total_drive_hours"],
-            )
-            for idx, option in enumerate(route_options):
-                option["is_fastest"] = idx == fastest_index
-                option["label"] = "Fastest route" if option["is_fastest"] else "Alternative route"
-
-            # Use the fastest route as the primary trip geometry.
-            best_route = route_options[fastest_index]
-            
-            best_route["stops"] = enrich_stop_metadata(
-                best_route["stops"],
-                best_route["route_geometry"],
-                best_route["total_distance_miles"],
-                best_route["route_instructions"],
-                resolve_real_poi=True,
-            )
-
-            trip.route_options = route_options
-            trip.route_instructions = best_route["route_instructions"]
-            trip.leg1_miles = best_route["leg1_miles"]
-            trip.leg2_miles = best_route["leg2_miles"]
-            trip.leg1_duration_hours = best_route["leg1_duration_hours"]
-            trip.leg2_duration_hours = best_route["leg2_duration_hours"]
-            trip.total_distance_miles = best_route["total_distance_miles"]
-            trip.route_geometry = best_route["route_geometry"]
-            trip.stops = best_route["stops"]
-            trip.daily_logs = best_route["daily_logs"]
-            trip.total_on_duty_hours = best_route["total_on_duty_hours"]
-            trip.total_drive_hours = best_route["total_drive_hours"]
-            trip.hos_compliant = best_route["hos_compliant"]
-            trip.weekly_hours_used = best_route["weekly_hours_used"]
-            trip.weekly_hours_remaining = best_route["weekly_hours_remaining"]
-            
-            trip.status = Trip.Status.COMPUTED
-            trip.save()
-            logger.info("Trip %s fully computed in %.2fs", trip.id, perf_counter() - request_started_at)
-
+        if getattr(settings, "TRIP_COMPUTE_ASYNC", True):
+            payload_data = dict(data)
+            transaction.on_commit(lambda: start_trip_compute_job(trip.id, payload_data))
             output_serializer = TripDetailSerializer(trip)
-            return Response(output_serializer.data, status=status.HTTP_201_CREATED)
+            return Response(output_serializer.data, status=status.HTTP_202_ACCEPTED)
 
-        except ValueError as e:
-            trip.status = Trip.Status.FAILED
-            trip.error_message = str(e)
-            trip.save()
-            return Response(
-                {
-                    **error_payload(
-                        code="trip_planning_failed",
-                        message=str(e),
-                    ),
-                    "trip_id": str(trip.id),
-                },
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            )
-        except Exception as e:
-            logger.exception("Unexpected error computing trip %s", trip.id)
-            trip.status = Trip.Status.FAILED
-            trip.error_message = f"Internal error: {str(e)}"
-            trip.save()
+        try:
+            _compute_trip_payload(trip.id, dict(data))
+            trip.refresh_from_db()
+            output_serializer = TripDetailSerializer(trip)
+            if trip.status == Trip.Status.FAILED:
+                return Response(
+                    {
+                        **error_payload(
+                            code="trip_planning_failed",
+                            message=trip.error_message,
+                        ),
+                        "trip_id": str(trip.id),
+                    },
+                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+            return Response(output_serializer.data, status=status.HTTP_201_CREATED)
+        except Exception:
+            trip.refresh_from_db()
             return Response(
                 error_payload(
                     code="internal_error",

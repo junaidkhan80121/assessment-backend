@@ -1,10 +1,12 @@
 from unittest.mock import patch
 
 import pytest
+from django.test import override_settings
 from rest_framework.test import APIClient
 
 
 @pytest.mark.django_db
+@override_settings(TRIP_COMPUTE_ASYNC=False)
 def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
     client = APIClient()
 
@@ -128,6 +130,7 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
 
 
 @pytest.mark.django_db
+@override_settings(TRIP_COMPUTE_ASYNC=False)
 def test_create_trip_projects_generated_stop_markers_onto_route():
     client = APIClient()
 
@@ -215,6 +218,7 @@ def test_create_trip_projects_generated_stop_markers_onto_route():
 
 
 @pytest.mark.django_db
+@override_settings(TRIP_COMPUTE_ASYNC=False)
 def test_create_trip_surfaces_variant_failure_reason():
     client = APIClient()
 
@@ -252,3 +256,27 @@ def test_create_trip_surfaces_variant_failure_reason():
 
     assert response.status_code == 422
     assert "70-hour" in response.json()["message"]
+
+
+@pytest.mark.django_db
+@override_settings(TRIP_COMPUTE_ASYNC=False)
+def test_create_trip_rejects_non_us_manual_coordinates():
+    client = APIClient()
+
+    payload = {
+        "current_location": "Toronto, ON",
+        "current_location_lat": 43.6532,
+        "current_location_lon": -79.3832,
+        "pickup_location": "Indianapolis, IN",
+        "pickup_location_lat": 39.7684,
+        "pickup_location_lon": -86.1581,
+        "dropoff_location": "Nashville, TN",
+        "dropoff_location_lat": 36.1627,
+        "dropoff_location_lon": -86.7816,
+        "current_cycle_used": 10.0,
+    }
+
+    response = client.post("/api/trips/", payload, format="json")
+
+    assert response.status_code == 400
+    assert "United States" in str(response.json())

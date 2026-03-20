@@ -3,6 +3,7 @@ DRF Serializers for Trip model.
 """
 from rest_framework import serializers
 from .models import Trip
+from .routing import is_probably_us_location_label, is_us_coordinate
 
 
 class TripCreateSerializer(serializers.ModelSerializer):
@@ -39,6 +40,18 @@ class TripCreateSerializer(serializers.ModelSerializer):
             if (lat is None) != (lon is None):
                 raise serializers.ValidationError(
                     {prefix: "Latitude and longitude must be provided together."}
+                )
+            label = attrs.get(prefix, "")
+            if (
+                lat is not None
+                and lon is not None
+                and (
+                    not is_us_coordinate(lat, lon)
+                    or not is_probably_us_location_label(label)
+                )
+            ):
+                raise serializers.ValidationError(
+                    {prefix: "Locations must be within the United States."}
                 )
 
         return attrs
@@ -104,3 +117,36 @@ class TripDetailSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+
+class TripListSerializer(serializers.ModelSerializer):
+    """Compact serializer for paginated trip history results."""
+
+    log_days = serializers.SerializerMethodField()
+    stop_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Trip
+        fields = [
+            "id",
+            "current_location",
+            "pickup_location",
+            "dropoff_location",
+            "current_cycle_used",
+            "status",
+            "error_message",
+            "total_distance_miles",
+            "total_drive_hours",
+            "hos_compliant",
+            "created_at",
+            "updated_at",
+            "log_days",
+            "stop_count",
+        ]
+        read_only_fields = fields
+
+    def get_log_days(self, obj: Trip) -> int:
+        return len(obj.daily_logs or [])
+
+    def get_stop_count(self, obj: Trip) -> int:
+        return len(obj.stops or [])

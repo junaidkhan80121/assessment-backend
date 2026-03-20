@@ -62,6 +62,69 @@ def _decode_polyline(encoded: str) -> list[list[float]]:
     return coords
 
 ORS_BASE_URL = "https://api.openrouteservice.org"
+
+
+NON_US_LOCATION_TOKENS = (
+    ", canada",
+    ", mexico",
+    ", united kingdom",
+    ", uk",
+    ", england",
+    ", scotland",
+    ", wales",
+    ", france",
+    ", germany",
+    ", spain",
+    ", italy",
+    ", india",
+    ", china",
+    ", japan",
+    ", australia",
+    ", brazil",
+    ", ontario",
+    ", quebec",
+    ", british columbia",
+    ", alberta",
+    ", manitoba",
+    ", saskatchewan",
+    ", nova scotia",
+    ", new brunswick",
+    ", newfoundland",
+    ", prince edward island",
+    ", northwest territories",
+    ", nunavut",
+    ", yukon",
+    ", on",
+    ", qc",
+    ", bc",
+    ", ab",
+    ", mb",
+    ", sk",
+    ", ns",
+    ", nb",
+    ", nl",
+    ", pe",
+    ", nt",
+    ", nu",
+    ", yt",
+)
+
+
+def is_us_coordinate(lat: float, lon: float) -> bool:
+    """
+    Broad US bounds check that covers the contiguous US plus Alaska and Hawaii.
+    """
+    in_contiguous_us = 24.0 <= lat <= 49.5 and -125.0 <= lon <= -66.0
+    in_alaska = 51.0 <= lat <= 72.0 and -180.0 <= lon <= -129.0
+    in_hawaii = 18.0 <= lat <= 23.0 and -161.0 <= lon <= -154.0
+    return in_contiguous_us or in_alaska or in_hawaii
+
+
+def is_probably_us_location_label(label: str) -> bool:
+    normalized = f" {label.strip().lower()} "
+    if " united states" in normalized or " usa" in normalized or " us " in normalized:
+        return True
+    return not any(token in normalized for token in NON_US_LOCATION_TOKENS)
 def geocode_location(query: str) -> dict:
     """
     Geocode a location string to lat/lon using a provider chain.
@@ -92,6 +155,8 @@ def geocode_location(query: str) -> dict:
             if data.get("features"):
                 coords = data["features"][0]["geometry"]["coordinates"]
                 label = data["features"][0]["properties"].get("label", query)
+                if not is_us_coordinate(coords[1], coords[0]) or not is_probably_us_location_label(label):
+                    raise ValueError(f"Location must be within the United States: {query}")
                 result = {"lat": coords[1], "lon": coords[0], "label": label}
                 cache.set(cache_key, result, timeout=getattr(settings, "GEOCODE_CACHE_TIMEOUT", 86400))
                 return result
@@ -117,10 +182,15 @@ def geocode_location(query: str) -> dict:
         data = resp.json()
         if data:
             top_result = data[0]
+            display_name = top_result.get("display_name", query)
+            result_lat = float(top_result["lat"])
+            result_lon = float(top_result["lon"])
+            if not is_us_coordinate(result_lat, result_lon) or not is_probably_us_location_label(display_name):
+                raise ValueError(f"Location must be within the United States: {query}")
             result = {
-                "lat": float(top_result["lat"]),
-                "lon": float(top_result["lon"]),
-                "label": top_result.get("display_name", query),
+                "lat": result_lat,
+                "lon": result_lon,
+                "label": display_name,
             }
             cache.set(cache_key, result, timeout=getattr(settings, "GEOCODE_CACHE_TIMEOUT", 86400))
             return result
