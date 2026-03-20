@@ -146,9 +146,65 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
     geocode_mock.assert_not_called()
 
     data = response.json()
-    assert len(data["route_options"]) == 4
+    assert len(data["route_options"]) == 2
+    assert data["route_options"][0]["is_fastest"] is True
+    assert data["route_options"][1]["label"] == "Alternative route"
     assert any(option["is_fastest"] for option in data["route_options"])
     assert len(data["route_instructions"]) == 2
+
+
+@pytest.mark.django_db
+@override_settings(TRIP_COMPUTE_ASYNC=False, ROUTE_INCLUDE_ALTERNATIVES=True)
+def test_create_trip_fetches_route_alternatives_with_only_two_route_calls():
+    client = APIClient()
+
+    payload = {
+        "current_location": "Chicago, IL",
+        "current_location_lat": 41.8781,
+        "current_location_lon": -87.6298,
+        "pickup_location": "Indianapolis, IN",
+        "pickup_location_lat": 39.7684,
+        "pickup_location_lon": -86.1581,
+        "dropoff_location": "Nashville, TN",
+        "dropoff_location_lat": 36.1627,
+        "dropoff_location_lon": -86.7816,
+        "current_cycle_used": 12.0,
+    }
+
+    def route_stub(*args, **kwargs):
+        alternatives = bool(args[4]) if len(args) >= 5 else bool(kwargs.get("alternatives", False))
+        start_lat = args[1] if len(args) >= 2 else kwargs["start_lat"]
+        if start_lat == 41.8781:
+            routes = [
+                {"distance_miles": 180.0, "duration_hours": 3.2, "geometry": [[41.8781, -87.6298], [39.7684, -86.1581]], "instructions": []},
+                {"distance_miles": 210.0, "duration_hours": 3.8, "geometry": [[41.8781, -87.6298], [40.8, -86.9], [39.7684, -86.1581]], "instructions": []},
+            ]
+        else:
+            routes = [
+                {"distance_miles": 300.0, "duration_hours": 5.5, "geometry": [[39.7684, -86.1581], [36.1627, -86.7816]], "instructions": []},
+                {"distance_miles": 330.0, "duration_hours": 5.9, "geometry": [[39.7684, -86.1581], [36.45, -87.1], [36.1627, -86.7816]], "instructions": []},
+            ]
+        return routes if alternatives else routes[0]
+
+    def plan_trip_stub(**kwargs):
+        return {
+            "stops": [],
+            "daily_logs": [],
+            "total_on_duty_hours": 14.0,
+            "total_drive_hours": round(kwargs["leg1_duration_hours"] + kwargs["leg2_duration_hours"], 2),
+            "hos_compliant": True,
+            "weekly_hours_used": 26.0,
+            "weekly_hours_remaining": 44.0,
+        }
+
+    with patch("trips.views.geocode_location") as geocode_mock, patch(
+        "trips.views.get_route", side_effect=route_stub
+    ) as route_mock, patch("trips.views.plan_trip", side_effect=plan_trip_stub):
+        response = client.post("/api/trips/", payload, format="json")
+
+    assert response.status_code == 201
+    geocode_mock.assert_not_called()
+    assert route_mock.call_count == 2
 
 
 @pytest.mark.django_db
@@ -268,7 +324,7 @@ def test_create_trip_caps_combined_alternative_candidates_for_faster_compute():
 
     assert response.status_code == 201
     data = response.json()
-    assert len(data["route_options"]) == 4
+    assert len(data["route_options"]) == 2
     assert plan_trip_mock.call_count == 4
 
 

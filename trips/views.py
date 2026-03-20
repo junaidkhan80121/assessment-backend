@@ -48,6 +48,14 @@ def route_geometry_signature(geometry: list[list[float]]) -> tuple:
     )
 
 
+def route_option_signature(option: dict) -> tuple:
+    return (
+        round(float(option.get("total_distance_miles", 0.0) or 0.0), 1),
+        round(float(option.get("total_drive_hours", 0.0) or 0.0), 2),
+        route_geometry_signature(option.get("route_geometry", [])),
+    )
+
+
 def dedupe_route_variants(routes: list[dict]) -> list[dict]:
     unique_routes: list[dict] = []
     seen_signatures: set[tuple] = set()
@@ -90,6 +98,22 @@ def build_route_candidate_pairs(
         (candidate_index, leg1_route, leg2_route)
         for _, _, candidate_index, leg1_route, leg2_route in ranked_candidates[:max_candidates]
     ]
+
+
+def select_returned_route_options(route_options: list[dict], max_returned_options: int) -> list[dict]:
+    selected_options: list[dict] = []
+    seen_signatures: set[tuple] = set()
+
+    for option in route_options:
+        signature = route_option_signature(option)
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        selected_options.append(option)
+        if len(selected_options) >= max_returned_options:
+            break
+
+    return selected_options
 
 
 def _compute_trip_payload(trip_id, data: dict) -> None:
@@ -174,86 +198,84 @@ def _compute_trip_payload(trip_id, data: dict) -> None:
         variant_errors: list[str] = []
 
         for variant_index, leg1_route, leg2_route in route_candidate_pairs:
-                leg1_miles = leg1_route["distance_miles"]
-                leg2_miles = leg2_route["distance_miles"]
-                leg1_duration = leg1_route["duration_hours"]
-                leg2_duration = leg2_route["duration_hours"]
-                total_distance = leg1_miles + leg2_miles
-                geometry = leg1_route["geometry"] + leg2_route["geometry"]
-                instructions = [
-                    *leg1_route.get("instructions", []),
-                    *leg2_route.get("instructions", []),
-                ]
+            leg1_miles = leg1_route["distance_miles"]
+            leg2_miles = leg2_route["distance_miles"]
+            leg1_duration = leg1_route["duration_hours"]
+            leg2_duration = leg2_route["duration_hours"]
+            total_distance = leg1_miles + leg2_miles
 
-                try:
-                    hos_started_at = perf_counter()
-                    hos_result = plan_trip(
-                        total_distance_miles=total_distance,
-                        leg1_miles=leg1_miles,
-                        leg2_miles=leg2_miles,
-                        leg1_duration_hours=leg1_duration,
-                        leg2_duration_hours=leg2_duration,
-                        current_cycle_used=data["current_cycle_used"],
-                        pickup_location=data["pickup_location"],
-                        dropoff_location=data["dropoff_location"],
-                        pickup_lat=pickup_geo["lat"],
-                        pickup_lon=pickup_geo["lon"],
-                        dropoff_lat=dropoff_geo["lat"],
-                        dropoff_lon=dropoff_geo["lon"],
-                        current_location=data["current_location"],
-                        current_lat=current_geo["lat"],
-                        current_lon=current_geo["lon"],
-                    )
-                    logger.info(
-                        "Trip %s HOS planning for variant %s completed in %.2fs",
-                        trip.id,
-                        variant_index,
-                        perf_counter() - hos_started_at,
-                    )
-                    enriched_stops = enrich_stop_metadata(
-                        hos_result["stops"],
-                        geometry,
-                        total_distance,
-                        instructions,
-                        resolve_real_poi=False,
-                    )
+            try:
+                hos_started_at = perf_counter()
+                hos_result = plan_trip(
+                    total_distance_miles=total_distance,
+                    leg1_miles=leg1_miles,
+                    leg2_miles=leg2_miles,
+                    leg1_duration_hours=leg1_duration,
+                    leg2_duration_hours=leg2_duration,
+                    current_cycle_used=data["current_cycle_used"],
+                    pickup_location=data["pickup_location"],
+                    dropoff_location=data["dropoff_location"],
+                    pickup_lat=pickup_geo["lat"],
+                    pickup_lon=pickup_geo["lon"],
+                    dropoff_lat=dropoff_geo["lat"],
+                    dropoff_lon=dropoff_geo["lon"],
+                    current_location=data["current_location"],
+                    current_lat=current_geo["lat"],
+                    current_lon=current_geo["lon"],
+                )
+                logger.info(
+                    "Trip %s HOS planning for variant %s completed in %.2fs",
+                    trip.id,
+                    variant_index,
+                    perf_counter() - hos_started_at,
+                )
 
-                    route_options.append({
-                        "id": variant_index,
-                        "leg1_miles": leg1_miles,
-                        "leg2_miles": leg2_miles,
-                        "total_distance_miles": total_distance,
-                        "leg1_duration_hours": leg1_duration,
-                        "leg2_duration_hours": leg2_duration,
-                        "route_geometry": geometry,
-                        "route_instructions": instructions,
-                        "stops": enriched_stops,
-                        "daily_logs": hos_result["daily_logs"],
-                        "total_on_duty_hours": hos_result["total_on_duty_hours"],
-                        "total_drive_hours": hos_result["total_drive_hours"],
-                        "hos_compliant": hos_result["hos_compliant"],
-                        "weekly_hours_used": hos_result["weekly_hours_used"],
-                        "weekly_hours_remaining": hos_result["weekly_hours_remaining"],
-                    })
-                except ValueError as e:
-                    variant_errors.append(str(e))
-                    logger.warning("Variant %s violated constraints immediately: %s", variant_index, e)
+                route_options.append({
+                    "id": variant_index,
+                    "leg1_miles": leg1_miles,
+                    "leg2_miles": leg2_miles,
+                    "total_distance_miles": total_distance,
+                    "leg1_duration_hours": leg1_duration,
+                    "leg2_duration_hours": leg2_duration,
+                    "route_geometry": leg1_route["geometry"] + leg2_route["geometry"],
+                    "route_instructions": [
+                        *leg1_route.get("instructions", []),
+                        *leg2_route.get("instructions", []),
+                    ],
+                    "stops": hos_result["stops"],
+                    "daily_logs": hos_result["daily_logs"],
+                    "total_on_duty_hours": hos_result["total_on_duty_hours"],
+                    "total_drive_hours": hos_result["total_drive_hours"],
+                    "hos_compliant": hos_result["hos_compliant"],
+                    "weekly_hours_used": hos_result["weekly_hours_used"],
+                    "weekly_hours_remaining": hos_result["weekly_hours_remaining"],
+                })
+            except ValueError as e:
+                variant_errors.append(str(e))
+                logger.warning("Variant %s violated constraints immediately: %s", variant_index, e)
 
         if not route_options:
             if variant_errors:
                 raise ValueError(variant_errors[0])
             raise ValueError("No viable routes could be planned within limits.")
 
-        route_options.sort(key=lambda opt: opt["total_distance_miles"])
-        fastest_index = min(
-            range(len(route_options)),
-            key=lambda idx: route_options[idx]["total_drive_hours"],
+        route_options.sort(key=lambda opt: (opt["total_drive_hours"], opt["total_distance_miles"], opt["id"]))
+        route_options = select_returned_route_options(
+            route_options,
+            max_returned_options=max(1, getattr(settings, "ROUTE_MAX_RETURNED_OPTIONS", 2)),
         )
         for idx, option in enumerate(route_options):
-            option["is_fastest"] = idx == fastest_index
+            option["stops"] = enrich_stop_metadata(
+                option["stops"],
+                option["route_geometry"],
+                option["total_distance_miles"],
+                option["route_instructions"],
+                resolve_real_poi=False,
+            )
+            option["is_fastest"] = idx == 0
             option["label"] = "Fastest route" if option["is_fastest"] else "Alternative route"
 
-        best_route = route_options[fastest_index]
+        best_route = route_options[0]
         best_route["stops"] = enrich_stop_metadata(
             best_route["stops"],
             best_route["route_geometry"],
