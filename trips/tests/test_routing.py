@@ -31,6 +31,7 @@ def clear_trip_cache():
 @patch("trips.routing.requests.get")
 def test_geocode_location_uses_nominatim_when_ors_is_unavailable(mock_get, settings):
     settings.ORS_API_KEY = "ors-key"
+    settings.MAPBOX_ACCESS_TOKEN = ""
     mock_get.side_effect = [
         requests.RequestException("ors down"),
         _response(
@@ -57,6 +58,7 @@ def test_geocode_location_uses_nominatim_when_ors_is_unavailable(mock_get, setti
 @patch("trips.routing.requests.get")
 def test_geocode_location_raises_for_unknown_location(mock_get, settings):
     settings.ORS_API_KEY = ""
+    settings.MAPBOX_ACCESS_TOKEN = ""
     mock_get.return_value = _response([])
 
     with pytest.raises(ValueError, match="Could not geocode location"):
@@ -67,6 +69,7 @@ def test_geocode_location_raises_for_unknown_location(mock_get, settings):
 @patch("trips.routing.requests.get")
 def test_geocode_location_uses_known_city_fallback_before_failing(mock_get, settings):
     settings.ORS_API_KEY = ""
+    settings.MAPBOX_ACCESS_TOKEN = ""
     mock_get.side_effect = requests.RequestException("nominatim down")
 
     result = geocode_location("Chicago, IL")
@@ -79,6 +82,7 @@ def test_geocode_location_uses_known_city_fallback_before_failing(mock_get, sett
 @patch("trips.routing.requests.get")
 def test_geocode_location_uses_cache_for_repeat_queries(mock_get, settings):
     settings.ORS_API_KEY = ""
+    settings.MAPBOX_ACCESS_TOKEN = ""
     mock_get.return_value = _response(
         [
             {
@@ -158,6 +162,7 @@ def test_find_nearby_stop_poi_returns_none_when_mapbox_lookup_fails(mock_get, se
 @patch("trips.routing.requests.get")
 def test_geocode_location_rejects_non_us_result_even_if_provider_returns_one(mock_get, settings):
     settings.ORS_API_KEY = ""
+    settings.MAPBOX_ACCESS_TOKEN = ""
     mock_get.return_value = _response(
         [
             {
@@ -170,3 +175,30 @@ def test_geocode_location_rejects_non_us_result_even_if_provider_returns_one(moc
 
     with pytest.raises(ValueError, match="United States"):
         geocode_location("Toronto, Canada")
+
+
+@pytest.mark.django_db
+@patch("trips.routing.requests.get")
+def test_geocode_location_prefers_mapbox_when_token_is_configured(mock_get, settings):
+    settings.MAPBOX_ACCESS_TOKEN = "mapbox-token"
+    settings.ORS_API_KEY = "ors-key"
+    mock_get.return_value = _response(
+        {
+            "features": [
+                {
+                    "geometry": {"coordinates": [-87.6298, 41.8781]},
+                    "properties": {"full_address": "Chicago, Illinois, United States"},
+                }
+            ]
+        }
+    )
+
+    result = geocode_location("Chicago, IL")
+
+    assert result == {
+        "lat": 41.8781,
+        "lon": -87.6298,
+        "label": "Chicago, Illinois, United States",
+    }
+    called_url = mock_get.call_args.args[0]
+    assert "mapbox.com/search/geocode/v6/forward" in called_url

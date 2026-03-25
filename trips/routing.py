@@ -7,10 +7,23 @@ import math
 import logging
 import hashlib
 import requests
+from time import perf_counter
 from django.conf import settings
 from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
+
+
+def _timed_get(url: str, *, timeout: int | float, **kwargs):
+    started_at = perf_counter()
+    response = requests.get(url, timeout=timeout, **kwargs)
+    return response, perf_counter() - started_at
+
+
+def _timed_post(url: str, *, timeout: int | float, **kwargs):
+    started_at = perf_counter()
+    response = requests.post(url, timeout=timeout, **kwargs)
+    return response, perf_counter() - started_at
 
 
 def _cache_key(prefix: str, *parts: object) -> str:
@@ -125,6 +138,8 @@ def is_probably_us_location_label(label: str) -> bool:
     if " united states" in normalized or " usa" in normalized or " us " in normalized:
         return True
     return not any(token in normalized for token in NON_US_LOCATION_TOKENS)
+
+
 def geocode_location(query: str) -> dict:
     """
     Geocode a location string to lat/lon using a provider chain.
@@ -134,12 +149,54 @@ def geocode_location(query: str) -> dict:
     cache_key = _cache_key("geocode", normalized_query.lower())
     cached = cache.get(cache_key)
     if cached is not None:
+        logger.info("Geocode cache hit for %s", query)
         return cached
+
+    geocode_timeout = getattr(settings, "GEOCODE_PROVIDER_TIMEOUT_SECONDS", 5)
+
+    mapbox_access_token = getattr(settings, "MAPBOX_ACCESS_TOKEN", "")
+    if mapbox_access_token:
+        try:
+            resp, duration = _timed_get(
+                "https://api.mapbox.com/search/geocode/v6/forward",
+                params={
+                    "access_token": mapbox_access_token,
+                    "q": query,
+                    "country": "US",
+                    "language": "en",
+                    "limit": 1,
+                },
+                timeout=geocode_timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info("Mapbox geocode for %s completed in %.2fs", query, duration)
+
+            features = data.get("features", []) or []
+            if features:
+                feature = features[0]
+                coords = feature.get("geometry", {}).get("coordinates", [])
+                properties = feature.get("properties", {}) or {}
+                label = (
+                    properties.get("full_address")
+                    or properties.get("name")
+                    or feature.get("place_name")
+                    or query
+                )
+                if len(coords) < 2:
+                    raise ValueError(f"Mapbox geocode returned incomplete coordinates for: {query}")
+                if not is_us_coordinate(coords[1], coords[0]) or not is_probably_us_location_label(label):
+                    raise ValueError(f"Location must be within the United States: {query}")
+                result = {"lat": coords[1], "lon": coords[0], "label": label}
+                cache.set(cache_key, result, timeout=getattr(settings, "GEOCODE_CACHE_TIMEOUT", 86400))
+                return result
+        except requests.RequestException as e:
+            logger.warning("Mapbox geocode failed for %s: %s", query, e)
 
     api_key = getattr(settings, "ORS_API_KEY", "")
     if api_key:
         try:
-            resp = requests.get(
+            resp, duration = _timed_get(
                 f"{ORS_BASE_URL}/geocode/search",
                 params={
                     "api_key": api_key,
@@ -147,10 +204,11 @@ def geocode_location(query: str) -> dict:
                     "size": 1,
                     "boundary.country": "US",
                 },
-                timeout=10,
+                timeout=geocode_timeout,
             )
             resp.raise_for_status()
             data = resp.json()
+            logger.info("ORS geocode for %s completed in %.2fs", query, duration)
 
             if data.get("features"):
                 coords = data["features"][0]["geometry"]["coordinates"]
@@ -164,7 +222,7 @@ def geocode_location(query: str) -> dict:
             logger.warning("ORS geocode failed for %s: %s", query, e)
 
     try:
-        resp = requests.get(
+        resp, duration = _timed_get(
             "https://nominatim.openstreetmap.org/search",
             params={
                 "format": "jsonv2",
@@ -176,10 +234,11 @@ def geocode_location(query: str) -> dict:
                 "User-Agent": "eld-trip-planner/1.0",
                 "Accept": "application/json",
             },
-            timeout=10,
+            timeout=geocode_timeout,
         )
         resp.raise_for_status()
         data = resp.json()
+        logger.info("Nominatim geocode for %s completed in %.2fs", query, duration)
         if data:
             top_result = data[0]
             display_name = top_result.get("display_name", query)
@@ -232,18 +291,37 @@ def get_route(
     )
     cached = cache.get(cache_key)
     if cached is not None:
+        logger.info(
+            "Route cache hit for %.5f,%.5f -> %.5f,%.5f (alternatives=%s)",
+            start_lat,
+            start_lon,
+            end_lat,
+            end_lon,
+            alternatives,
+        )
         return cached
 
     access_token = getattr(settings, "MAPBOX_ACCESS_TOKEN", "")
+    route_timeout = getattr(settings, "ROUTE_PROVIDER_TIMEOUT_SECONDS", 20)
 
     if access_token:
         try:
+            started_at = perf_counter()
             result = _get_mapbox_route(
                 start_lon=start_lon,
                 start_lat=start_lat,
                 end_lon=end_lon,
                 end_lat=end_lat,
                 alternatives=alternatives,
+                timeout=route_timeout,
+            )
+            logger.info(
+                "Mapbox route %.5f,%.5f -> %.5f,%.5f completed in %.2fs",
+                start_lat,
+                start_lon,
+                end_lat,
+                end_lon,
+                perf_counter() - started_at,
             )
             cache.set(cache_key, result, timeout=getattr(settings, "ROUTE_CACHE_TIMEOUT", 21600))
             return result
@@ -253,12 +331,22 @@ def get_route(
     ors_api_key = getattr(settings, "ORS_API_KEY", "")
     if ors_api_key:
         try:
+            started_at = perf_counter()
             result = _get_ors_route(
                 start_lon=start_lon,
                 start_lat=start_lat,
                 end_lon=end_lon,
                 end_lat=end_lat,
                 alternatives=alternatives,
+                timeout=route_timeout,
+            )
+            logger.info(
+                "ORS route %.5f,%.5f -> %.5f,%.5f completed in %.2fs",
+                start_lat,
+                start_lon,
+                end_lat,
+                end_lon,
+                perf_counter() - started_at,
             )
             cache.set(cache_key, result, timeout=getattr(settings, "ROUTE_CACHE_TIMEOUT", 21600))
             return result
@@ -347,6 +435,7 @@ def _get_mapbox_route(
     end_lon: float,
     end_lat: float,
     alternatives: bool,
+    timeout: int | float = 30,
 ) -> dict | list[dict]:
     coordinates = f"{start_lon},{start_lat};{end_lon},{end_lat}"
     url = f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/{coordinates}"
@@ -359,7 +448,7 @@ def _get_mapbox_route(
         "alternatives": "true" if alternatives else "false",
     }
 
-    resp = requests.get(url, params=params, timeout=30)
+    resp, _ = _timed_get(url, params=params, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     routes = data.get("routes", [])
@@ -388,6 +477,7 @@ def _get_ors_route(
     end_lon: float,
     end_lat: float,
     alternatives: bool,
+    timeout: int | float = 30,
 ) -> dict | list[dict]:
     headers = {
         "Authorization": getattr(settings, "ORS_API_KEY", ""),
@@ -408,11 +498,11 @@ def _get_ors_route(
     if not alternatives:
         body.pop("alternative_routes")
 
-    resp = requests.post(
+    resp, _ = _timed_post(
         f"{ORS_BASE_URL}/v2/directions/driving-hgv/geojson",
         json=body,
         headers=headers,
-        timeout=30,
+        timeout=timeout,
     )
     resp.raise_for_status()
     data = resp.json()
