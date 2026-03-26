@@ -11,12 +11,12 @@ from django.conf import settings
 from django.db import transaction
 from django.db import close_old_connections
 from django.views.decorators.csrf import csrf_exempt
-from rest_framework import viewsets, status
+from rest_framework import serializers, viewsets, status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
-from drf_spectacular.utils import OpenApiResponse, extend_schema, extend_schema_view
+from drf_spectacular.utils import OpenApiResponse, extend_schema, extend_schema_view, inline_serializer
 
 from .models import Trip
 from .serializers import TripCreateSerializer, TripDetailSerializer, TripListSerializer
@@ -331,26 +331,25 @@ def start_trip_compute_job(trip_id, data: dict) -> None:
     thread.start()
 
 
-@csrf_exempt
-@api_view(["GET", "HEAD"])
-@authentication_classes([])
-@permission_classes([AllowAny])
 @extend_schema(
     summary="Health check",
     description="Public health check endpoint for uptime monitoring.",
     responses={
         200: OpenApiResponse(
-            response={
-                "type": "object",
-                "properties": {
-                    "status": {"type": "string", "example": "ok"},
+            response=inline_serializer(
+                name="HealthCheckResponse",
+                fields={
+                    "status": serializers.CharField(default="ok"),
                 },
-                "required": ["status"],
-            },
+            ),
             description="Service is healthy.",
         )
     },
 )
+@csrf_exempt
+@api_view(["GET", "HEAD"])
+@authentication_classes([])
+@permission_classes([AllowAny])
 def health_check(_request):
     """Lightweight uptime endpoint for hosting health checks."""
     return Response({"status": "ok"})
