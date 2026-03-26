@@ -16,7 +16,7 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
-from drf_spectacular.utils import extend_schema, extend_schema_view
+from drf_spectacular.utils import OpenApiResponse, extend_schema, extend_schema_view
 
 from .models import Trip
 from .serializers import TripCreateSerializer, TripDetailSerializer, TripListSerializer
@@ -335,6 +335,22 @@ def start_trip_compute_job(trip_id, data: dict) -> None:
 @api_view(["GET", "HEAD"])
 @authentication_classes([])
 @permission_classes([AllowAny])
+@extend_schema(
+    summary="Health check",
+    description="Public health check endpoint for uptime monitoring.",
+    responses={
+        200: OpenApiResponse(
+            response={
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "example": "ok"},
+                },
+                "required": ["status"],
+            },
+            description="Service is healthy.",
+        )
+    },
+)
 def health_check(_request):
     """Lightweight uptime endpoint for hosting health checks."""
     return Response({"status": "ok"})
