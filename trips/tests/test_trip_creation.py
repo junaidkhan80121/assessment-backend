@@ -140,7 +140,7 @@ def test_create_trip_reuses_client_coordinates_and_returns_alternatives():
     with patch("trips.views.geocode_location") as geocode_mock, patch(
         "trips.views.get_route", side_effect=route_stub
     ), patch("trips.views.plan_trip", side_effect=plan_trip_stub):
-        response = client.post("/api/trips/", payload, format="json")
+        response = client.post("/api/v1/trips/", payload, format="json")
 
     assert response.status_code == 201
     geocode_mock.assert_not_called()
@@ -200,7 +200,7 @@ def test_create_trip_fetches_route_alternatives_with_only_two_route_calls():
     with patch("trips.views.geocode_location") as geocode_mock, patch(
         "trips.views.get_route", side_effect=route_stub
     ) as route_mock, patch("trips.views.plan_trip", side_effect=plan_trip_stub):
-        response = client.post("/api/trips/", payload, format="json")
+        response = client.post("/api/v1/trips/", payload, format="json")
 
     assert response.status_code == 201
     geocode_mock.assert_not_called()
@@ -251,7 +251,7 @@ def test_create_trip_defaults_to_single_route_option_for_faster_compute():
     with patch("trips.views.geocode_location") as geocode_mock, patch(
         "trips.views.get_route", side_effect=route_stub
     ), patch("trips.views.plan_trip", side_effect=plan_trip_stub):
-        response = client.post("/api/trips/", payload, format="json")
+        response = client.post("/api/v1/trips/", payload, format="json")
 
     assert response.status_code == 201
     geocode_mock.assert_not_called()
@@ -320,7 +320,7 @@ def test_create_trip_caps_combined_alternative_candidates_for_faster_compute():
     with patch("trips.views.geocode_location"), patch(
         "trips.views.get_route", side_effect=route_stub
     ), patch("trips.views.plan_trip", side_effect=plan_trip_stub) as plan_trip_mock:
-        response = client.post("/api/trips/", payload, format="json")
+        response = client.post("/api/v1/trips/", payload, format="json")
 
     assert response.status_code == 201
     data = response.json()
@@ -406,7 +406,7 @@ def test_create_trip_projects_generated_stop_markers_onto_route():
             "category": "Rest area",
         },
     ):
-        response = client.post("/api/trips/", payload, format="json")
+        response = client.post("/api/v1/trips/", payload, format="json")
 
     assert response.status_code == 201
     data = response.json()
@@ -484,7 +484,7 @@ def test_create_trip_can_resolve_real_stop_pois_when_enabled():
             "category": "Rest area",
         },
     ):
-        response = client.post("/api/trips/", payload, format="json")
+        response = client.post("/api/v1/trips/", payload, format="json")
 
     assert response.status_code == 201
     data = response.json()
@@ -533,8 +533,8 @@ def test_create_trip_reuses_identical_computed_trip_without_recomputing():
     with patch("trips.views.geocode_location") as geocode_mock, patch(
         "trips.views.get_route", return_value=route
     ) as route_mock, patch("trips.views.plan_trip", side_effect=plan_trip_stub) as plan_trip_mock:
-        first_response = client.post("/api/trips/", payload, format="json")
-        second_response = client.post("/api/trips/", payload, format="json")
+        first_response = client.post("/api/v1/trips/", payload, format="json")
+        second_response = client.post("/api/v1/trips/", payload, format="json")
 
     assert first_response.status_code == 201
     assert second_response.status_code == 200
@@ -579,7 +579,7 @@ def test_create_trip_surfaces_variant_failure_reason():
     with patch("trips.views.geocode_location"), patch(
         "trips.views.get_route", side_effect=route_stub
     ):
-        response = client.post("/api/trips/", payload, format="json")
+        response = client.post("/api/v1/trips/", payload, format="json")
 
     assert response.status_code == 422
     assert "70-hour" in response.json()["message"]
@@ -603,7 +603,7 @@ def test_create_trip_rejects_non_us_manual_coordinates():
         "current_cycle_used": 10.0,
     }
 
-    response = client.post("/api/trips/", payload, format="json")
+    response = client.post("/api/v1/trips/", payload, format="json")
 
     assert response.status_code == 400
     assert "United States" in str(response.json())

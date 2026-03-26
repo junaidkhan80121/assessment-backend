@@ -12,7 +12,7 @@ This is the Django backend for the FMCSA-compliant ELD Trip Planner application.
 - **Framework**: Django 4.2+ & Django REST Framework
 - **Authentication**: SimpleJWT
 - **Database**: SQLite (local dev) / PostgreSQL (production via Neon)
-- **API Documentation**: drf-spectacular (Swagger UI / ReDoc)
+- **API Documentation**: drf-spectacular (Swagger UI)
 - **Security**: django-cors-headers, django-csp
 
 ## Getting Started
@@ -43,8 +43,7 @@ This is the Django backend for the FMCSA-compliant ELD Trip Planner application.
 ## API Documentation
 
 When the server is running, you can access the interactive API documentation at:
-- **Swagger UI**: `http://localhost:8000/api/docs/`
-- **ReDoc**: `http://localhost:8000/api/redoc/`
+- **Swagger UI**: `http://localhost:8000/api/v1/docs/`
 
 ## Testing
 

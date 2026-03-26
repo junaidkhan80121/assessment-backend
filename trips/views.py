@@ -10,9 +10,11 @@ from time import perf_counter
 from django.conf import settings
 from django.db import transaction
 from django.db import close_old_connections
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework import viewsets, status
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, extend_schema_view
 
@@ -329,7 +331,10 @@ def start_trip_compute_job(trip_id, data: dict) -> None:
     thread.start()
 
 
+@csrf_exempt
 @api_view(["GET", "HEAD"])
+@authentication_classes([])
+@permission_classes([AllowAny])
 def health_check(_request):
     """Lightweight uptime endpoint for hosting health checks."""
     return Response({"status": "ok"})
